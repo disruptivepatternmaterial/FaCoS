@@ -1,7 +1,7 @@
 # FaCoS
 Fake ESU ECoS using Node-Red to Integrate with iTrain or JMRI
 
-What would you want this? Well the makers of iTrain refuse to put an MQTT interface or some other open interface into the application. JMRI has, but you know, I've been writting and using software for 40 years and was not able to get JMRI working, whereas iTrain I had working in a few hours.
+What would you want this? Well the makers of iTrain have so far refused to put an MQTT interface or some other open interface into the application. JMRI has, but you know, I've been writting and using software for 40 years and was not able to get JMRI working, whereas iTrain I had working in a few hours.
 
 You know YMMV...
 
