@@ -1,0 +1,125 @@
+<REPLY get(1, info)>
+1 ECoS
+1 ProtocolVersion[0.5]
+1 ApplicationVersion[4.2.13]
+1 HardwareVersion[2.1]
+<END 0 (OK)>
+<REPLY get(1, status)>
+1 status[GO]
+<END 0 (OK)>
+<REPLY request(1, view)>
+<END 0 (OK)>
+<REPLY set(1, stop)>
+<END 0 (OK)>
+<EVENT 1>
+1 status[STOP]
+<END 0 (OK)>
+<REPLY set(1, go)>
+<END 0 (OK)>
+<EVENT 1>
+1 status[GO]
+<END 0 (OK)>
+<REPLY queryObjects(10)>
+1000
+<END 0 (OK)>
+<REPLY queryObjects(10, name)>
+1000 name["Fake Locomotive 1000"]
+<END 0 (OK)>
+<REPLY queryObjects(10, addr)>
+1000 addr[3]
+<END 0 (OK)>
+<REPLY queryObjects(10, name, addr)>
+1000 name["Fake Locomotive 1000"] addr[3]
+<END 0 (OK)>
+<REPLY queryObjects(10, nr[0,3000])>
+1000
+<END 0 (OK)>
+<REPLY get(10, size)>
+10 size[1]
+<END 0 (OK)>
+<REPLY request(10, view)>
+<END 0 (OK)>
+<REPLY request(1000, view)>
+<END 0 (OK)>
+<REPLY request(1000, control)>
+<END 0 (OK)>
+<REPLY get(1000, name)>
+1000 name["Fake Locomotive 1000"]
+<END 0 (OK)>
+<REPLY get(1000, addr, protocol, speedstep, dir)>
+1000 addr[3]
+1000 protocol[DCC28]
+1000 speedstep[0]
+1000 dir[0]
+<END 0 (OK)>
+<REPLY set(1000, speedstep[14], dir[1])>
+<END 0 (OK)>
+<EVENT 1000>
+1000 speedstep[14]
+1000 dir[1]
+<END 0 (OK)>
+# sideEffect mqtt trains/device/3 = 14,1
+<REPLY get(1000, func[0])>
+1000 func[0, 0]
+<END 0 (OK)>
+<REPLY set(1000, func[0, 1])>
+<END 0 (OK)>
+<EVENT 1000>
+1000 func[0, 1]
+<END 0 (OK)>
+<REPLY get(1000, func[0])>
+1000 func[0, 1]
+<END 0 (OK)>
+<REPLY get(1000, locodesc)>
+1000 locodesc[IMAGE_TYPE_INT, 0]
+<END 0 (OK)>
+<REPLY release(1000, control)>
+<END 0 (OK)>
+<REPLY release(1000, view)>
+<END 0 (OK)>
+<REPLY queryObjects(26)>
+200
+<END 0 (OK)>
+<REPLY queryObjects(26, ports)>
+200 ports[2]
+<END 0 (OK)>
+<REPLY get(26, size)>
+26 size[1]
+<END 0 (OK)>
+<REPLY request(200, view)>
+<END 0 (OK)>
+<REPLY get(200, state)>
+200 state[0x0]
+<END 0 (OK)>
+<REPLY get(200, railcom[0])>
+200 railcom[00, 0000, 0]
+<END 0 (OK)>
+<REPLY get(200, railcom[1])>
+200 railcom[01, 0000, 0]
+<END 0 (OK)>
+<REPLY release(200, view)>
+<END 0 (OK)>
+<REPLY request(11, view, viewswitch)>
+<END 0 (OK)>
+<REPLY set(11, switch[DCC4g])>
+<END 0 (OK)>
+<EVENT 11>
+11 switch[DCC4g]
+<END 0 (OK)>
+# sideEffect mqtt trains/device/4 = g
+<REPLY set(11, switch[DCC4r])>
+<END 0 (OK)>
+<EVENT 11>
+11 switch[DCC4r]
+<END 0 (OK)>
+# sideEffect mqtt trains/device/4 = r
+<REPLY set(11, switch[MOT5g])>
+<END 0 (OK)>
+<EVENT 11>
+11 switch[MOT5g]
+<END 0 (OK)>
+# sideEffect mqtt trains/device/5 = g
+<REPLY release(11, view)>
+<END 0 (OK)>
+<REPLY release(1, view)>
+<END 0 (OK)>

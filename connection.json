@@ -1,0 +1,5 @@
+{
+  "tcp_port": 15471,
+  "mqtt_topic_prefix": "trains/device/",
+  "trace_log_path": "cursor-scratch/facos-trace.log"
+}

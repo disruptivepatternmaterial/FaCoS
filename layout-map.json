@@ -1,0 +1,18 @@
+{
+  "accessories": {
+    "4": { "ha_entity": "switch.odb_relays_1_1", "on": "g", "off": "r" },
+    "5": { "ha_entity": "switch.odb_relays_1_1_2", "on": "g", "off": "r" }
+  },
+  "feedback": {
+    "200": {
+      "ports": 2,
+      "port_sensors": [
+        "binary_sensor.train_prox_1_sensor_1",
+        "binary_sensor.train_prox_1_sensor_2"
+      ]
+    }
+  },
+  "loks": {
+    "1000": { "addr": 3, "name": "Fake Locomotive 1000", "protocol": "DCC28" }
+  }
+}

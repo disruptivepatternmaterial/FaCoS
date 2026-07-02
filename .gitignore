@@ -128,4 +128,10 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
-.DS_Store
+
+# FaCoS test artifacts
+tests/actual-replies.txt
+tests/.nr-data/
+tests/.mqtt-cap.log
+tests/test-flow.json
+cursor-scratch/

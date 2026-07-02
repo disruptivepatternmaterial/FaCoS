@@ -1,0 +1,489 @@
+{
+  "27d8ff35b4e13404": {
+    "id": "27d8ff35b4e13404",
+    "type": "function",
+    "z": "ae42528ac326c82b",
+    "name": "accessory handler",
+    "func": "var partsArray = msg.payload.split('[');\nvar id = partsArray[1].split(']');\nvar foo = id[0].substr(id[0].length - 1);\nvar bar = id[0].replace(foo,'');\nmsg.raw = { address : bar, wire: foo };\nmsg.payload = '<REPLY set(11,switch[' + bar + foo + '])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 860,
+    "y": 1460,
+    "wires": [
+      [
+        "b6e4f6de6c577084",
+        "4e2cc9eb2ddadad8"
+      ]
+    ]
+  },
+  "4e2cc9eb2ddadad8": {
+    "id": "4e2cc9eb2ddadad8",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "raw",
+        "tot": "msg"
+      },
+      {
+        "t": "delete",
+        "p": "raw",
+        "pt": "msg"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1120,
+    "y": 1460,
+    "wires": [
+      [
+        "5fa77ac5974b1f68",
+        "7485938bd6ccdaec"
+      ]
+    ]
+  },
+  "7485938bd6ccdaec": {
+    "id": "7485938bd6ccdaec",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "topic",
+        "pt": "msg",
+        "to": "'trains/device/' & payload.address",
+        "tot": "jsonata"
+      },
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "payload.wire",
+        "tot": "jsonata"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1360,
+    "y": 1460,
+    "wires": [
+      [
+        "6d6000f15fe09e73"
+      ]
+    ]
+  },
+  "24dc6b2d70f47d9e": {
+    "id": "24dc6b2d70f47d9e",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "raw",
+        "tot": "msg"
+      },
+      {
+        "t": "delete",
+        "p": "raw",
+        "pt": "msg"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1120,
+    "y": 1500,
+    "wires": [
+      [
+        "4721cdc23d5f9473",
+        "5fa77ac5974b1f68"
+      ]
+    ]
+  },
+  "4721cdc23d5f9473": {
+    "id": "4721cdc23d5f9473",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "topic",
+        "pt": "msg",
+        "to": "'trains/device/' & payload.address",
+        "tot": "jsonata"
+      },
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "payload.speed & ',' & payload.dir",
+        "tot": "jsonata"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1360,
+    "y": 1500,
+    "wires": [
+      [
+        "6d6000f15fe09e73"
+      ]
+    ]
+  },
+  "160be93ff00baee4": {
+    "id": "160be93ff00baee4",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "topic",
+        "pt": "msg",
+        "to": "trains/device/1000",
+        "tot": "str"
+      },
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "0,0",
+        "tot": "str"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1260,
+    "y": 1060,
+    "wires": [
+      [
+        "6d6000f15fe09e73"
+      ]
+    ]
+  },
+  "affe2618d7b80853": {
+    "id": "affe2618d7b80853",
+    "type": "change",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "topic",
+        "pt": "msg",
+        "to": "trains/device/1000",
+        "tot": "str"
+      },
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "0,1",
+        "tot": "str"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 1260,
+    "y": 1100,
+    "wires": [
+      [
+        "6d6000f15fe09e73"
+      ]
+    ]
+  },
+  "f235fbbc2f3535a6": {
+    "id": "f235fbbc2f3535a6",
+    "type": "mqtt in",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "topic": "trains/device/4",
+    "qos": "0",
+    "datatype": "auto-detect",
+    "broker": "4e91dd5ffb6a9ee8",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 300,
+    "y": 2100,
+    "wires": [
+      [
+        "b13bfa380f4582a8"
+      ]
+    ]
+  },
+  "b13bfa380f4582a8": {
+    "id": "b13bfa380f4582a8",
+    "type": "switch",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "property": "payload",
+    "propertyType": "msg",
+    "rules": [
+      {
+        "t": "eq",
+        "v": "g",
+        "vt": "str"
+      },
+      {
+        "t": "eq",
+        "v": "r",
+        "vt": "str"
+      },
+      {
+        "t": "else"
+      }
+    ],
+    "checkall": "true",
+    "repair": false,
+    "outputs": 3,
+    "x": 470,
+    "y": 2100,
+    "wires": [
+      [
+        "3843a287d6cf613b"
+      ],
+      [
+        "1bf2aa2b2ca64b87"
+      ],
+      []
+    ]
+  },
+  "3843a287d6cf613b": {
+    "id": "3843a287d6cf613b",
+    "type": "api-call-service",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "server": "85b918fc1d4c8834",
+    "version": 7,
+    "debugenabled": false,
+    "action": "switch.turn_off",
+    "floorId": [],
+    "areaId": [],
+    "deviceId": [],
+    "entityId": [
+      "switch.odb_relays_1_1"
+    ],
+    "labelId": [],
+    "data": "",
+    "dataType": "jsonata",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "all",
+    "blockInputOverrides": false,
+    "domain": "switch",
+    "service": "turn_off",
+    "x": 690,
+    "y": 2060,
+    "wires": [
+      [
+        "819cbcfaac7e43b2"
+      ]
+    ]
+  },
+  "1bf2aa2b2ca64b87": {
+    "id": "1bf2aa2b2ca64b87",
+    "type": "api-call-service",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "server": "85b918fc1d4c8834",
+    "version": 7,
+    "debugenabled": false,
+    "action": "switch.turn_on",
+    "floorId": [],
+    "areaId": [],
+    "deviceId": [],
+    "entityId": [
+      "switch.odb_relays_1_1"
+    ],
+    "labelId": [],
+    "data": "",
+    "dataType": "jsonata",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "all",
+    "blockInputOverrides": false,
+    "domain": "switch",
+    "service": "turn_on",
+    "x": 690,
+    "y": 2120,
+    "wires": [
+      [
+        "819cbcfaac7e43b2"
+      ]
+    ]
+  },
+  "cfd7460388fc6861": {
+    "id": "cfd7460388fc6861",
+    "type": "server-state-changed",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "server": "85b918fc1d4c8834",
+    "version": 6,
+    "outputs": 1,
+    "exposeAsEntityConfig": "",
+    "entities": {
+      "entity": [
+        "binary_sensor.train_prox_1_sensor_1"
+      ],
+      "substring": [],
+      "regex": []
+    },
+    "outputInitially": true,
+    "stateType": "habool",
+    "ifState": "",
+    "ifStateType": "str",
+    "ifStateOperator": "is",
+    "outputOnlyOnStateChange": true,
+    "for": "0",
+    "forType": "num",
+    "forUnits": "minutes",
+    "ignorePrevStateNull": false,
+    "ignorePrevStateUnknown": false,
+    "ignorePrevStateUnavailable": false,
+    "ignoreCurrentStateUnknown": false,
+    "ignoreCurrentStateUnavailable": false,
+    "outputProperties": [
+      {
+        "property": "payload",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      },
+      {
+        "property": "data",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "eventData"
+      },
+      {
+        "property": "topic",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "triggerId"
+      }
+    ],
+    "x": 500,
+    "y": 2500,
+    "wires": [
+      [
+        "975d7c4f38a65f93",
+        "8759c8a437d1bfc1"
+      ]
+    ]
+  },
+  "b922981349a7ceb7": {
+    "id": "b922981349a7ceb7",
+    "type": "server-state-changed",
+    "z": "ae42528ac326c82b",
+    "name": "",
+    "server": "85b918fc1d4c8834",
+    "version": 6,
+    "outputs": 1,
+    "exposeAsEntityConfig": "",
+    "entities": {
+      "entity": [
+        "binary_sensor.train_prox_1_sensor_2"
+      ],
+      "substring": [],
+      "regex": []
+    },
+    "outputInitially": true,
+    "stateType": "habool",
+    "ifState": "",
+    "ifStateType": "str",
+    "ifStateOperator": "is",
+    "outputOnlyOnStateChange": true,
+    "for": "0",
+    "forType": "num",
+    "forUnits": "minutes",
+    "ignorePrevStateNull": false,
+    "ignorePrevStateUnknown": false,
+    "ignorePrevStateUnavailable": false,
+    "ignoreCurrentStateUnknown": false,
+    "ignoreCurrentStateUnavailable": false,
+    "outputProperties": [
+      {
+        "property": "payload",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      },
+      {
+        "property": "data",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "eventData"
+      },
+      {
+        "property": "topic",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "triggerId"
+      }
+    ],
+    "x": 500,
+    "y": 2680,
+    "wires": [
+      [
+        "8c4c6a01b0f20286",
+        "62431382951c2f6b",
+        "8759c8a437d1bfc1"
+      ]
+    ]
+  },
+  "8759c8a437d1bfc1": {
+    "id": "8759c8a437d1bfc1",
+    "type": "function",
+    "z": "ae42528ac326c82b",
+    "name": "function 114",
+    "func": "var state = flow.get(\"feedback1.state\") || 0;\nif (msg.topic == \"binary_sensor.train_prox_1_sensor_2\") {\n    if (msg.payload) {\n        state = state + 2;\n    } else {\n        state = Math.abs(state - 2);\n    }\n    flow.set(\"feedback1.state\", state)\n} else if (msg.topic == \"binary_sensor.train_prox_1_sensor_1\") {\n    if (msg.payload) {\n        state = state + 1;\n    } else {\n        state = Math.abs(state - 1);\n    }\n    flow.set(\"feedback1.state\", state)\n}\n\nvar newpay = '<EVENT 200>\\n'\n    + '200 state[0x' + state + ']\\n'\n    + '<END 0 (OK)>\\n';\n    \nmsg.payload = {};\nmsg.data = {};\nmsg.payload = newpay;\n\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "// Code added here will be run once\n// whenever the node is started.\nflow.set(\"feedback1.state\", 0);",
+    "finalize": "// Code added here will be run when the\n// node is being stopped or re-deployed.\nflow.set(\"feedback1.state\", 0);",
+    "libs": [],
+    "x": 990,
+    "y": 2420,
+    "wires": [
+      [
+        "3f14b0e4c447f516",
+        "60c17d2810d96548"
+      ]
+    ]
+  }
+}

@@ -1,5 +1,265 @@
 [
     {
+        "id": "ae42528ac326c82b",
+        "type": "tab",
+        "label": "FaCoS",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "fa1e6a01b0f10022",
+        "type": "comment",
+        "z": "ae42528ac326c82b",
+        "name": "FaCoS - Fake ECoS PC-Interface (see README.md)",
+        "info": "Verification commands:\n  jq empty flow.json                                            # JSON valid\n  node tests/parser-unit.js                                     # parser layer\n  bash tests/run-tests.sh                                       # tcp roundtrip\n  bash tests/diff-sidewires.sh                                  # sidewire byte check\n\nSee SPEC-NOTES.md for the §-by-§ mapping to handlers.\n",
+        "x": 220,
+        "y": 60,
+        "wires": []
+    },
+    {
+        "id": "fa1e6a01b0f10010",
+        "type": "inject",
+        "z": "ae42528ac326c82b",
+        "name": "boot facos",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "0.1",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 180,
+        "y": 140,
+        "wires": [
+            [
+                "fa1e6a01b0f10011"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10011",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "init flow.facos",
+        "func": "\n// FaCoS ECoS PC-Interface command parser.\n//\n// Single source of truth for tokenizing, dispatching, and formatting replies\n// for the ESU PC-Interface protocol (spec v0.2 / §7) plus the JMRI / Rocrail\n// superset that real clients emit on the wire.\n//\n// Two consumers:\n//   1. `tests/parser-unit.js` `require()`s this directly under Node.\n//   2. `flow.json`'s parser function node has this file's body inlined verbatim\n//      (the function-node body strips the trailing `module.exports` block).\n//\n// The handler signature is intentionally pure: it takes (rawFrame, sessionId,\n// state) and returns { reply, sideEffects, events, raw, parsed }. The flow\n// node mutates `state` (which is the `flow.facos` flow-context object) in\n// place, then routes the returned arrays to the side-effect / fan-out wires.\n\n// -- Error codes (spec §5 + JMRI's NetworkErrorCodes table) --\nconst ERR = {\n  OK:              { code: 0,  name: 'OK' },\n  BADPARAMETER:    { code: 15, name: 'NERROR_BADPARAMETER' },\n  NOOBJECT:        { code: 19, name: 'NERROR_NOOBJECT' },\n  NOPARAMETER:     { code: 20, name: 'NERROR_NOPARAMETER' },\n  NOCONTROL:       { code: 25, name: 'NERROR_NOCONTROL' },\n  NOAPPEND:        { code: 27, name: 'NERROR_NOAPPEND' },\n  NOAPPEND35:      { code: 35, name: 'NERROR_NOAPPEND' },\n};\n\nconst VALID_PROTOCOLS = new Set([\n  'MM14', 'MM27', 'MM28', 'DCC14', 'DCC28', 'DCC128', 'SX32', 'MMFKT',\n]);\n\n// -------------------------------------------------------------------------\n// Tokenizer / parser\n// -------------------------------------------------------------------------\n// Grammar (per ESU spec §5):\n//   command   := name '(' id (',' option)* ')'\n//   option    := name | name '[' arg (',' arg)* ']'\n//   arg       := bareword | quoted\n//   quoted    := '\"' (any | '\"\"')* '\"'\n//\n// Whitespace inside parens is permitted. iTrain emits no whitespace; JMRI\n// emits ', '. Both must round-trip.\n//\n// `tokenize` returns { cmd, id, options } or throws SyntaxError. The error\n// message is propagated as `<END 15 (NERROR_BADPARAMETER)>` by the caller.\n\nfunction tokenize(input) {\n  if (typeof input !== 'string') {\n    throw new SyntaxError('input must be string');\n  }\n  const s = input.replace(/[\\r\\n]+$/, '');\n  let i = 0;\n\n  function skipSpace() {\n    while (i < s.length && (s[i] === ' ' || s[i] === '\\t')) i++;\n  }\n\n  skipSpace();\n  let cmd = '';\n  while (i < s.length && /[A-Za-z]/.test(s[i])) cmd += s[i++];\n  if (!cmd) throw new SyntaxError('missing command name');\n  skipSpace();\n  if (s[i] !== '(') throw new SyntaxError(\"expected '('\");\n  i++;\n  skipSpace();\n\n  let idStr = '';\n  while (i < s.length && /[0-9]/.test(s[i])) idStr += s[i++];\n  if (!idStr) throw new SyntaxError('missing id');\n  const id = parseInt(idStr, 10);\n  skipSpace();\n\n  const options = [];\n  while (s[i] === ',') {\n    i++;\n    skipSpace();\n    let name = '';\n    while (i < s.length && /[A-Za-z0-9_]/.test(s[i])) name += s[i++];\n    if (!name) throw new SyntaxError('missing option name');\n    skipSpace();\n    const args = [];\n    if (s[i] === '[') {\n      i++;\n      skipSpace();\n      if (s[i] === ']') {\n        i++;\n      } else {\n        while (true) {\n          let arg;\n          if (s[i] === '\"') {\n            i++;\n            let str = '';\n            while (i < s.length) {\n              if (s[i] === '\"') {\n                if (s[i + 1] === '\"') { str += '\"'; i += 2; continue; }\n                i++;\n                break;\n              }\n              str += s[i++];\n            }\n            arg = { kind: 'string', value: str };\n          } else {\n            let raw = '';\n            while (i < s.length && s[i] !== ',' && s[i] !== ']') raw += s[i++];\n            raw = raw.trim();\n            if (raw === '') throw new SyntaxError('empty arg');\n            arg = { kind: 'token', value: raw };\n          }\n          args.push(arg);\n          skipSpace();\n          if (s[i] === ',') { i++; skipSpace(); continue; }\n          if (s[i] === ']') { i++; break; }\n          throw new SyntaxError(\"expected ',' or ']' in args\");\n        }\n      }\n      skipSpace();\n    }\n    options.push({ name, args });\n    skipSpace();\n  }\n  if (s[i] !== ')') throw new SyntaxError(\"expected ')'\");\n  i++;\n  skipSpace();\n  if (i !== s.length) throw new SyntaxError('trailing content after )');\n  return { cmd, id, options };\n}\n\n// -------------------------------------------------------------------------\n// Reply formatter\n// -------------------------------------------------------------------------\n// Every reply has the shape\n//   <REPLY <raw>>\\n\n//   <body lines, each ending in \\n>\n//   <END N (NAME)>\\n\n// `formatReply` accepts the original raw frame so the echo is byte-identical\n// to the client's command (iTrain sends no whitespace, JMRI sends ', ' — both\n// must round-trip exactly).\n\nfunction formatReply(raw, body, err) {\n  err = err || ERR.OK;\n  const lines = [`<REPLY ${raw}>`];\n  if (body && body.length) {\n    for (const ln of body) lines.push(ln);\n  }\n  lines.push(`<END ${err.code} (${err.name})>`);\n  return lines.join('\\n') + '\\n';\n}\n\nfunction formatEvent(objectId, body) {\n  const lines = [`<EVENT ${objectId}>`];\n  if (body && body.length) {\n    for (const ln of body) lines.push(ln);\n  }\n  lines.push('<END 0 (OK)>');\n  return lines.join('\\n') + '\\n';\n}\n\n// Render a JS value back to its on-the-wire form.\n//   string  -> \"...\"  with embedded \"  doubled\n//   number  -> as-is\n//   boolean -> 0 / 1\nfunction fmtArg(v) {\n  if (typeof v === 'string') {\n    return '\"' + v.replace(/\"/g, '\"\"') + '\"';\n  }\n  if (typeof v === 'boolean') return v ? '1' : '0';\n  return String(v);\n}\n\n// -------------------------------------------------------------------------\n// idClass: classify an id into its handler bucket.\n// -------------------------------------------------------------------------\nfunction idClass(id) {\n  if (id === 1)  return 'ecos';\n  if (id === 5)  return 'progGleis';\n  if (id === 10) return 'lokmgr';\n  if (id === 11) return 'swmgr';\n  if (id === 12) return 'pendelmgr';\n  if (id === 20) return 'devmgr';\n  if (id === 25) return 'sniffer';\n  if (id === 26) return 'fbmgr';\n  if (id === 27) return 'booster';\n  if (id === 31) return 'stellpult';\n  if (id >= 100 && id <= 163) return 's88';\n  if (id >= 200 && id <= 299) return 'ecosDetector';\n  if (id >= 1000 && id < 20000) return 'lok';\n  if (id >= 20000) return 'accessory';\n  return null;\n}\n\n// -------------------------------------------------------------------------\n// State helpers\n// -------------------------------------------------------------------------\nfunction defaultState() {\n  return {\n    status: 'GO',\n    info: {\n      ecos: 'ECoS',\n      protocolVersion: '0.5',\n      applicationVersion: '4.2.13',\n      hardwareVersion: '2.1',\n      id: 0,\n    },\n    loks: {\n      1000: makeLok({\n        id: 1000, addr: 3, name: 'Fake Locomotive 1000', protocol: 'DCC28',\n      }),\n    },\n    accessories: {},\n    s88Modules: {},\n    ecosDetectors: {\n      200: { id: 200, ports: 2, state: 0, railcom: {} },\n    },\n    views: {},\n    controls: {},\n    nextLokId: 1001,\n    nextAccessoryId: 20001,\n    layout: { accessories: {}, feedback: {}, loks: {} },\n  };\n}\n\nfunction makeLok(opts) {\n  return {\n    id: opts.id,\n    addr: opts.addr,\n    name: opts.name,\n    protocol: opts.protocol,\n    speed: 0,\n    speedstep: 0,\n    dir: 0,\n    funcs: {},\n    funcdescs: {},\n    cvs: {},\n    favorit: 0,\n    sniffer: 0,\n    speedindicator: 0,\n    profile: '',\n    locodesc: { imagetype: 'IMAGE_TYPE_INT', imageindex: 0 },\n    symbol: 0,\n  };\n}\n\nfunction ensureView(state, objectId, sessionId) {\n  if (!state.views[objectId]) state.views[objectId] = [];\n  if (state.views[objectId].indexOf(sessionId) === -1) state.views[objectId].push(sessionId);\n}\n\nfunction dropView(state, objectId, sessionId) {\n  const v = state.views[objectId];\n  if (!v) return;\n  const idx = v.indexOf(sessionId);\n  if (idx !== -1) v.splice(idx, 1);\n}\n\nfunction viewersOf(state, objectId) {\n  return (state.views[objectId] || []).slice();\n}\n\n// -------------------------------------------------------------------------\n// Handlers\n// -------------------------------------------------------------------------\n// Each handler returns { body, err, sideEffects, events }. Caller wraps with\n// formatReply.\n\nfunction err(code, body) { return { body: body || [], err: code }; }\nfunction ok(body) { return { body: body || [], err: ERR.OK }; }\n\nfunction tokVal(arg) { return arg && arg.value; }\n\n// ---- id=1 ECoS ----\nfunction handleEcos(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 1, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 1, sessionId);\n    return ok();\n  }\n  if (cmd === 'set') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const op = options[0].name;\n    if (op === 'go' || op === 'stop' || op === 'shutdown') {\n      const next = op.toUpperCase();\n      const transition = state.status !== next;\n      state.status = next;\n      const events = [];\n      const viewers = viewersOf(state, 1);\n      if (transition && viewers.length) {\n        events.push({\n          subscribers: viewers,\n          payload: formatEvent(1, [`1 status[${next}]`]),\n        });\n      }\n      return { body: [], err: ERR.OK, events };\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    let bad = false;\n    for (const o of options) {\n      if (o.name === 'info') {\n        body.push(`1 ${state.info.ecos}`);\n        body.push(`1 ProtocolVersion[${state.info.protocolVersion}]`);\n        body.push(`1 ApplicationVersion[${state.info.applicationVersion}]`);\n        body.push(`1 HardwareVersion[${state.info.hardwareVersion}]`);\n      } else if (o.name === 'status') {\n        body.push(`1 status[${state.status}]`);\n      } else if (o.name === 'id') {\n        body.push(`1 id[${state.info.id}]`);\n      } else {\n        bad = true; break;\n      }\n    }\n    if (bad) return err(ERR.BADPARAMETER);\n    return ok(body);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- id=10 LokManager ----\nfunction handleLokMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 10, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 10, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      return ok([`10 size[${Object.keys(state.loks).length}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    return ok(queryLoks(state, options));\n  }\n  if (cmd === 'create') {\n    return createLok(state, options);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction lokInRange(lok, min, max) {\n  return lok.id >= min && lok.id <= max;\n}\n\nfunction queryLoks(state, options) {\n  let nrFilter = null;\n  const fields = [];\n  for (const o of options) {\n    if (o.name === 'nr') {\n      const a = o.args.map(tokVal).map(Number);\n      if (a.length === 2 && Number.isFinite(a[0]) && Number.isFinite(a[1])) nrFilter = [a[0], a[1]];\n    } else if (o.name === 'name' || o.name === 'addr' || o.name === 'protocol') {\n      fields.push(o.name);\n    }\n  }\n  const ids = Object.keys(state.loks).map(Number).sort((a, b) => a - b);\n  const out = [];\n  for (const id of ids) {\n    const lok = state.loks[id];\n    if (nrFilter && !lokInRange(lok, nrFilter[0], nrFilter[1])) continue;\n    if (!fields.length) {\n      out.push(`${lok.id}`);\n    } else {\n      const parts = [`${lok.id}`];\n      for (const f of fields) {\n        if (f === 'name') parts.push(`name[${fmtArg(lok.name)}]`);\n        else if (f === 'addr') parts.push(`addr[${lok.addr}]`);\n        else if (f === 'protocol') parts.push(`protocol[${lok.protocol}]`);\n      }\n      out.push(parts.join(' '));\n    }\n  }\n  return out;\n}\n\nfunction createLok(state, options) {\n  const append = options.some(o => o.name === 'append');\n  const discard = options.some(o => o.name === 'discard');\n  if (!append && !discard) return err(ERR.NOAPPEND);\n  if (discard) return ok();\n  const init = { id: state.nextLokId++, addr: 0, name: '', protocol: 'DCC28' };\n  for (const o of options) {\n    if (o.name === 'addr' && o.args.length) init.addr = Number(tokVal(o.args[0]));\n    if (o.name === 'name' && o.args.length) init.name = String(tokVal(o.args[0]));\n    if (o.name === 'protocol' && o.args.length) {\n      const p = String(tokVal(o.args[0]));\n      if (!VALID_PROTOCOLS.has(p)) return err(ERR.BADPARAMETER);\n      init.protocol = p;\n    }\n  }\n  const lok = makeLok(init);\n  state.loks[lok.id] = lok;\n  const body = [`${lok.id}`];\n  return { body, err: ERR.OK, events: [{\n    subscribers: viewersOf(state, 10),\n    payload: formatEvent(10, ['10 msg[LIST_CHANGED]']),\n  }] };\n}\n\n// ---- id=11 SchaltartikelManager ----\nfunction handleSwMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    const wantsView = options.some(o => o.name === 'view');\n    if (!wantsView) return err(ERR.BADPARAMETER);\n    ensureView(state, 11, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    if (!wantsView) return err(ERR.BADPARAMETER);\n    dropView(state, 11, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      return ok([`11 size[${Object.keys(state.accessories).length}]`]);\n    }\n    if (options.length && options[0].name === 'switch') {\n      const a = options[0].args[0];\n      if (!a) return err(ERR.NOPARAMETER);\n      const parsed2 = parseSwitchArg(tokVal(a));\n      if (!parsed2) return err(ERR.BADPARAMETER);\n      const key = `${parsed2.protocol}${parsed2.addr}`;\n      const acc = state.accessoriesByAddr ? state.accessoriesByAddr[key] : null;\n      const wire = acc ? acc.wire : null;\n      if (!wire) return err(ERR.NOOBJECT);\n      return ok([`11 switch[${parsed2.protocol}${parsed2.addr}${wire}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'set') {\n    if (options.length && options[0].name === 'switch') {\n      const a = options[0].args[0];\n      if (!a) return err(ERR.NOPARAMETER);\n      const parsed2 = parseSwitchArg(tokVal(a));\n      if (!parsed2) return err(ERR.BADPARAMETER);\n      if (!state.accessoriesByAddr) state.accessoriesByAddr = {};\n      const key = `${parsed2.protocol}${parsed2.addr}`;\n      state.accessoriesByAddr[key] = { ...parsed2 };\n      const events = [{\n        subscribers: viewersOf(state, 11),\n        payload: formatEvent(11, [`11 switch[${parsed2.protocol}${parsed2.addr}${parsed2.wire}]`]),\n      }];\n      const sideEffects = [{\n        kind: 'switch',\n        protocol: parsed2.protocol,\n        addr: parsed2.addr,\n        wire: parsed2.wire,\n      }];\n      return { body: [], err: ERR.OK, events, sideEffects };\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    const ids = Object.keys(state.accessories).map(Number).sort((a, b) => a - b);\n    return ok(ids.map(id => `${id}`));\n  }\n  if (cmd === 'create') {\n    const append = options.some(o => o.name === 'append');\n    const discard = options.some(o => o.name === 'discard');\n    if (!append && !discard) return err(ERR.NOAPPEND);\n    if (discard) return ok();\n    const id = state.nextAccessoryId++;\n    state.accessories[id] = { id, addr: 0, addrext: 0, protocol: 'DCC',\n      mode: 'SWITCH', duration: 250, name1: '', name2: '', name3: '',\n      symbol: 0, state: 0 };\n    return ok([`${id}`]);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction parseSwitchArg(s) {\n  if (!s) return null;\n  const m = /^(MOT|DCC)(\\d+)([rg])$/.exec(s);\n  if (!m) return null;\n  return { protocol: m[1], addr: parseInt(m[2], 10), wire: m[3] };\n}\n\n// ---- id=26 Feedback-Manager ----\nfunction handleFbMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 26, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 26, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      const n = Object.keys(state.s88Modules).length + Object.keys(state.ecosDetectors).length;\n      return ok([`26 size[${n}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    const wantPorts = options.some(o => o.name === 'ports');\n    const out = [];\n    const s88Ids = Object.keys(state.s88Modules).map(Number).sort((a, b) => a - b);\n    for (const id of s88Ids) {\n      const m = state.s88Modules[id];\n      out.push(wantPorts ? `${id} ports[${m.ports}]` : `${id}`);\n    }\n    const detIds = Object.keys(state.ecosDetectors).map(Number).sort((a, b) => a - b);\n    for (const id of detIds) {\n      const d = state.ecosDetectors[id];\n      out.push(wantPorts ? `${id} ports[${d.ports}]` : `${id}`);\n    }\n    return ok(out);\n  }\n  if (cmd === 'create') {\n    const add = options.find(o => o.name === 'add');\n    if (!add) return err(ERR.BADPARAMETER);\n    const args = add.args.map(tokVal).map(Number);\n    if (args.length < 2) return err(ERR.BADPARAMETER);\n    const pos = args[0];\n    const ports = args[1];\n    const id = 100 + pos;\n    if (id < 100 || id > 163) return err(ERR.BADPARAMETER);\n    state.s88Modules[id] = { id, ports, state: 0 };\n    return ok([`${id}`]);\n  }\n  if (cmd === 'delete') {\n    const del = options.find(o => o.name === 'del');\n    if (!del) return err(ERR.BADPARAMETER);\n    const pos = Number(tokVal(del.args[0]));\n    const id = 100 + pos;\n    if (state.s88Modules[id]) delete state.s88Modules[id];\n    return ok();\n  }\n  if (cmd === 'set') {\n    if (options.length && options[0].name === 'size') {\n      // accepted but no-op\n      return ok();\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- id≥1000 Lok ----\nfunction handleLok(parsed, sessionId, state) {\n  const { cmd, id, options } = parsed;\n  const lok = state.loks[id];\n  if (!lok) {\n    // delete on a missing lok still NOOBJECT.\n    return err(ERR.NOOBJECT);\n  }\n  if (cmd === 'request') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    const force = options.some(o => o.name === 'force');\n    if (wantsView) ensureView(state, id, sessionId);\n    if (wantsControl) {\n      const cur = state.controls[id];\n      if (cur && cur !== sessionId && !force) return err(ERR.NOCONTROL);\n      state.controls[id] = sessionId;\n    }\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    if (wantsView) dropView(state, id, sessionId);\n    if (wantsControl && state.controls[id] === sessionId) state.controls[id] = null;\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'get') return getLokFields(lok, id, options);\n  if (cmd === 'set') return setLokFields(state, lok, id, sessionId, options);\n  if (cmd === 'delete') {\n    delete state.loks[id];\n    return { body: [], err: ERR.OK, events: [{\n      subscribers: viewersOf(state, 10),\n      payload: formatEvent(10, ['10 msg[LIST_CHANGED]']),\n    }] };\n  }\n  if (cmd === 'link' || cmd === 'unlink') {\n    return ok();\n  }\n  if (cmd === 'queryObjects') {\n    return ok([]);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction getLokFields(lok, id, options) {\n  if (!options.length) return ok();\n  const body = [];\n  for (const o of options) {\n    const v = readLokField(lok, o);\n    if (v == null) return err(ERR.BADPARAMETER);\n    body.push(`${id} ${v}`);\n  }\n  return ok(body);\n}\n\nfunction readLokField(lok, o) {\n  switch (o.name) {\n    case 'addr':           return `addr[${lok.addr}]`;\n    case 'name':           return `name[${fmtArg(lok.name)}]`;\n    case 'protocol':       return `protocol[${lok.protocol}]`;\n    case 'speed':          return `speed[${lok.speed}]`;\n    case 'speedstep':      return `speedstep[${lok.speedstep}]`;\n    case 'dir':            return `dir[${lok.dir}]`;\n    case 'favorit':        return `favorit[${lok.favorit}]`;\n    case 'sniffer':        return `sniffer[${lok.sniffer}]`;\n    case 'speedindicator': return `speedindicator[${lok.speedindicator}]`;\n    case 'profile':        return `profile[${fmtArg(lok.profile)}]`;\n    case 'symbol':\n    case 'funcsymbol': {\n      const idx = o.args.length ? Number(tokVal(o.args[0])) : 0;\n      const v = lok.funcs[idx] || 0;\n      return `func[${idx}, ${v}]`;\n    }\n    case 'func': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      if (!Number.isFinite(idx)) return null;\n      const v = lok.funcs[idx] || 0;\n      return `func[${idx}, ${v}]`;\n    }\n    case 'funcdesc': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      const d = lok.funcdescs[idx];\n      if (!d) return `funcdesc[${idx}, 0]`;\n      return `funcdesc[${idx}, ${d.code}${d.moment ? ', moment' : ''}]`;\n    }\n    case 'funcexists': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      const exists = (lok.funcs[idx] !== undefined) || (lok.funcdescs[idx] !== undefined);\n      return `funcexists[${idx}, ${exists ? 1 : 0}]`;\n    }\n    case 'cv': {\n      if (o.args.length !== 1) return null;\n      const nr = Number(tokVal(o.args[0]));\n      const v = lok.cvs[nr];\n      if (v == null) return null;\n      return `cv[${nr}, ${v}]`;\n    }\n    case 'locodesc': {\n      const ld = lok.locodesc;\n      return `locodesc[${ld.imagetype}, ${ld.imageindex}]`;\n    }\n    default: return null;\n  }\n}\n\nfunction setLokFields(state, lok, id, sessionId, options) {\n  // Spec §5: set without control normally fails; iTrain skips request(control).\n  // Be lenient: only enforce control when a control owner is set and it's not us.\n  const owner = state.controls[id];\n  if (owner && owner !== sessionId) return err(ERR.NOCONTROL);\n  const sideEffects = [];\n  let speedTouched = false;\n  let dirTouched = false;\n  let funcTouched = null; // index that changed\n  for (const o of options) {\n    if (o.name === 'stop') {\n      lok.speed = 0; lok.speedstep = 0;\n      speedTouched = true;\n    } else if (o.name === 'speed' || o.name === 'speedstep') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const v = Number(tokVal(o.args[0]));\n      if (!Number.isFinite(v)) return err(ERR.BADPARAMETER);\n      lok[o.name] = v;\n      speedTouched = true;\n    } else if (o.name === 'dir') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const v = Number(tokVal(o.args[0]));\n      if (v !== 0 && v !== 1) return err(ERR.BADPARAMETER);\n      lok.dir = v;\n      dirTouched = true;\n    } else if (o.name === 'addr') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.addr = Number(tokVal(o.args[0]));\n    } else if (o.name === 'name') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.name = String(tokVal(o.args[0]));\n    } else if (o.name === 'protocol') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const p = String(tokVal(o.args[0]));\n      if (!VALID_PROTOCOLS.has(p)) return err(ERR.BADPARAMETER);\n      lok.protocol = p;\n    } else if (o.name === 'func') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const idx = Number(tokVal(o.args[0]));\n      const v = Number(tokVal(o.args[1]));\n      if (!Number.isFinite(idx)) return err(ERR.BADPARAMETER);\n      lok.funcs[idx] = v;\n      funcTouched = idx;\n    } else if (o.name === 'funcdesc') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const idx = Number(tokVal(o.args[0]));\n      const code = Number(tokVal(o.args[1]));\n      const moment = o.args.length >= 3 && tokVal(o.args[2]) === 'moment';\n      lok.funcdescs[idx] = { code, moment };\n    } else if (o.name === 'cv') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const nr = Number(tokVal(o.args[0]));\n      const v = Number(tokVal(o.args[1]));\n      lok.cvs[nr] = v;\n    } else if (o.name === 'favorit' || o.name === 'sniffer' || o.name === 'speedindicator') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok[o.name] = Number(tokVal(o.args[0]));\n    } else if (o.name === 'profile') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.profile = String(tokVal(o.args[0]));\n    } else if (o.name === 'symbol' || o.name === 'funcsymbol') {\n      // legacy aliases - swallow without error\n    } else {\n      return err(ERR.BADPARAMETER);\n    }\n  }\n  // MQTT side-effect for speed/dir mutations on our motor wire.\n  if (speedTouched || dirTouched) {\n    sideEffects.push({\n      kind: 'lokSpeed',\n      lokId: id,\n      addr: lok.addr,\n      speed: lok.speedstep || lok.speed || 0,\n      dir: lok.dir,\n    });\n  }\n  const events = [];\n  const viewers = viewersOf(state, id);\n  if (viewers.length) {\n    const lines = [];\n    if (speedTouched) lines.push(`${id} speedstep[${lok.speedstep}]`);\n    if (dirTouched) lines.push(`${id} dir[${lok.dir}]`);\n    if (funcTouched !== null) lines.push(`${id} func[${funcTouched}, ${lok.funcs[funcTouched]}]`);\n    if (lines.length) {\n      events.push({ subscribers: viewers, payload: formatEvent(id, lines) });\n    }\n  }\n  return { body: [], err: ERR.OK, sideEffects, events };\n}\n\n// ---- id≥20000 Schaltartikel object form (JMRI) ----\nfunction handleAccessory(parsed, sessionId, state) {\n  const { cmd, id, options } = parsed;\n  const acc = state.accessories[id];\n  if (!acc) return err(ERR.NOOBJECT);\n  if (cmd === 'request' || cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    if (wantsView) (cmd === 'request' ? ensureView : dropView)(state, id, sessionId);\n    if (wantsControl) {\n      if (cmd === 'request') state.controls[id] = sessionId;\n      else if (state.controls[id] === sessionId) state.controls[id] = null;\n    }\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    for (const o of options) {\n      switch (o.name) {\n        case 'state':    body.push(`${id} state[${acc.state}]`); break;\n        case 'addr':     body.push(`${id} addr[${acc.addr}]`); break;\n        case 'addrext':  body.push(`${id} addrext[${acc.addrext}]`); break;\n        case 'protocol': body.push(`${id} protocol[${acc.protocol}]`); break;\n        case 'name1':    body.push(`${id} name1[${fmtArg(acc.name1)}]`); break;\n        case 'name2':    body.push(`${id} name2[${fmtArg(acc.name2)}]`); break;\n        case 'name3':    body.push(`${id} name3[${fmtArg(acc.name3)}]`); break;\n        case 'symbol':   body.push(`${id} symbol[${acc.symbol}]`); break;\n        case 'mode':     body.push(`${id} mode[${acc.mode}]`); break;\n        case 'duration': body.push(`${id} duration[${acc.duration}]`); break;\n        default: return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok(body);\n  }\n  if (cmd === 'set') {\n    for (const o of options) {\n      switch (o.name) {\n        case 'state':    acc.state    = Number(tokVal(o.args[0])); break;\n        case 'addr':     acc.addr     = Number(tokVal(o.args[0])); break;\n        case 'addrext':  acc.addrext  = Number(tokVal(o.args[0])); break;\n        case 'protocol': acc.protocol = String(tokVal(o.args[0])); break;\n        case 'name1':    acc.name1    = String(tokVal(o.args[0])); break;\n        case 'name2':    acc.name2    = String(tokVal(o.args[0])); break;\n        case 'name3':    acc.name3    = String(tokVal(o.args[0])); break;\n        case 'symbol':   acc.symbol   = Number(tokVal(o.args[0])); break;\n        case 'mode':     acc.mode     = String(tokVal(o.args[0])); break;\n        case 'duration': acc.duration = Number(tokVal(o.args[0])); break;\n        default: return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok();\n  }\n  if (cmd === 'delete') {\n    delete state.accessories[id];\n    return ok();\n  }\n  if (cmd === 'link' || cmd === 'unlink') return ok();\n  if (cmd === 'queryObjects') return ok([]);\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- s88 (id 100..163) and ECoSDetector (id 200+) ----\nfunction handleS88(parsed, sessionId, state) {\n  return handleFeedbackModule(parsed, sessionId, state, 's88');\n}\nfunction handleEcosDetector(parsed, sessionId, state) {\n  return handleFeedbackModule(parsed, sessionId, state, 'ecosDetector');\n}\n\nfunction handleFeedbackModule(parsed, sessionId, state, kind) {\n  const { cmd, id, options } = parsed;\n  const bag = kind === 's88' ? state.s88Modules : state.ecosDetectors;\n  let mod = bag[id];\n  if (cmd === 'request' || cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    if (!mod) return err(ERR.NOOBJECT);\n    (cmd === 'request' ? ensureView : dropView)(state, id, sessionId);\n    return ok();\n  }\n  if (!mod) return err(ERR.NOOBJECT);\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    for (const o of options) {\n      if (o.name === 'state') {\n        const hex = '0x' + mod.state.toString(16);\n        body.push(`${id} state[${hex}]`);\n      } else if (o.name === 'ports') {\n        body.push(`${id} ports[${mod.ports}]`);\n      } else if (o.name === 'railcom') {\n        const port = o.args.length ? Number(tokVal(o.args[0])) : 0;\n        const rc = (mod.railcom || {})[port] || { addr: 0, dir: 0 };\n        const portStr = String(port).padStart(2, '0');\n        const addrStr = String(rc.addr).padStart(4, '0');\n        body.push(`${id} railcom[${portStr}, ${addrStr}, ${rc.dir}]`);\n      } else {\n        return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok(body);\n  }\n  if (cmd === 'set') {\n    for (const o of options) {\n      if (o.name === 'ports' && o.args.length) mod.ports = Number(tokVal(o.args[0]));\n      else if (o.name === 'state' && o.args.length) {\n        const v = String(tokVal(o.args[0]));\n        mod.state = v.startsWith('0x') ? parseInt(v.slice(2), 16) : parseInt(v, 10);\n      } else {\n        return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok();\n  }\n  if (cmd === 'delete') {\n    if (kind !== 's88') return err(ERR.BADPARAMETER);\n    delete state.s88Modules[id];\n    return ok();\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- Stub handlers for in-Planung sections ----\nfunction handleStub(parsed, sessionId, state) {\n  const { cmd } = parsed;\n  if (cmd === 'request' || cmd === 'release' || cmd === 'set' ||\n      cmd === 'get' || cmd === 'queryObjects' || cmd === 'create' ||\n      cmd === 'delete' || cmd === 'link' || cmd === 'unlink') {\n    return ok();\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- Top-level dispatch ----\nconst DISPATCH = {\n  ecos:         handleEcos,\n  lokmgr:       handleLokMgr,\n  swmgr:        handleSwMgr,\n  fbmgr:        handleFbMgr,\n  lok:          handleLok,\n  accessory:    handleAccessory,\n  s88:          handleS88,\n  ecosDetector: handleEcosDetector,\n  progGleis:    handleStub,\n  pendelmgr:    handleStub,\n  devmgr:       handleStub,\n  sniffer:      handleStub,\n  booster:      handleStub,\n  stellpult:    handleStub,\n};\n\n// `handle` is the public entry point. `raw` is one complete frame (no\n// trailing newline). `sessionId` is `msg._session.id`. `state` is the live\n// `flow.facos` object — handlers mutate it in place.\nfunction handle(raw, sessionId, state) {\n  const cleaned = String(raw).replace(/[\\r\\n]+$/, '').trim();\n  if (!cleaned) return null;\n  let parsed;\n  try {\n    parsed = tokenize(cleaned);\n  } catch (e) {\n    return {\n      raw: cleaned,\n      parsed: null,\n      reply: formatReply(cleaned, [], ERR.BADPARAMETER),\n      sideEffects: [],\n      events: [],\n    };\n  }\n  const klass = idClass(parsed.id);\n  if (!klass) {\n    return {\n      raw: cleaned,\n      parsed,\n      reply: formatReply(cleaned, [], ERR.NOOBJECT),\n      sideEffects: [],\n      events: [],\n    };\n  }\n  const fn = DISPATCH[klass];\n  let result;\n  try {\n    result = fn(parsed, sessionId, state);\n  } catch (e) {\n    return {\n      raw: cleaned,\n      parsed,\n      reply: formatReply(cleaned, [], ERR.BADPARAMETER),\n      sideEffects: [],\n      events: [],\n      error: e.message,\n    };\n  }\n  return {\n    raw: cleaned,\n    parsed,\n    reply: formatReply(cleaned, result.body || [], result.err || ERR.OK),\n    sideEffects: result.sideEffects || [],\n    events: result.events || [],\n  };\n}\n\n// -- TCP framer (per-session line buffer) --\n//\n// `feedFrame` accepts a chunk arriving on tcp in for a session and returns an\n// array of complete frames (no newline). It mutates `bufBag[sessionId]` for\n// stateful accumulation.\nfunction feedFrame(bufBag, sessionId, chunk) {\n  const prev = bufBag[sessionId] || '';\n  const combined = prev + String(chunk);\n  const parts = combined.split('\\n');\n  const tail = parts.pop();\n  bufBag[sessionId] = tail;\n  return parts.map(p => p.replace(/\\r+$/, ''));\n}\n\n\nflow.set('facos', defaultState());\nflow.set('facosBuf', {});\nflow.set('facosTraceEnabled', false);\nreturn msg;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 380,
+        "y": 140,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10012",
+        "type": "inject",
+        "z": "ae42528ac326c82b",
+        "name": "load layout-map",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "1",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 180,
+        "y": 180,
+        "wires": [
+            [
+                "fa1e6a01b0f10013"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10013",
+        "type": "file in",
+        "z": "ae42528ac326c82b",
+        "name": "layout-map.json",
+        "filename": "projects/bowman-mtn-node-red/FaCoS/layout-map.json",
+        "filenameType": "str",
+        "format": "utf8",
+        "chunk": false,
+        "sendError": false,
+        "encoding": "none",
+        "allProps": false,
+        "x": 400,
+        "y": 180,
+        "wires": [
+            [
+                "fa1e6a01b0f10014"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10014",
+        "type": "json",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 600,
+        "y": 180,
+        "wires": [
+            [
+                "fa1e6a01b0f10015"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10015",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "set flow.facos.layout",
+        "func": "\nlet st = flow.get('facos') || defaultState();\nst.layout = msg.payload;\nflow.set('facos', st);\nreturn null;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 820,
+        "y": 180,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10016",
+        "type": "inject",
+        "z": "ae42528ac326c82b",
+        "name": "load connection",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "1.2",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 180,
+        "y": 220,
+        "wires": [
+            [
+                "fa1e6a01b0f10017"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10017",
+        "type": "file in",
+        "z": "ae42528ac326c82b",
+        "name": "connection.json",
+        "filename": "projects/bowman-mtn-node-red/FaCoS/connection.json",
+        "filenameType": "str",
+        "format": "utf8",
+        "chunk": false,
+        "sendError": false,
+        "encoding": "none",
+        "allProps": false,
+        "x": 400,
+        "y": 220,
+        "wires": [
+            [
+                "fa1e6a01b0f10018"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10018",
+        "type": "json",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 600,
+        "y": 220,
+        "wires": [
+            [
+                "fa1e6a01b0f10019"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10019",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "set flow.facos.conn",
+        "func": "\nlet st = flow.get('facos') || {};\nst.conn = msg.payload;\nflow.set('facos', st);\nreturn null;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 820,
+        "y": 220,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f1000f",
+        "type": "inject",
+        "z": "ae42528ac326c82b",
+        "name": "toggle trace log",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 180,
+        "y": 260,
+        "wires": [
+            [
+                "fa1e6a01b0f1000e"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f1000e",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "toggle facosTraceEnabled",
+        "func": "\nconst cur = flow.get('facosTraceEnabled') || false;\nflow.set('facosTraceEnabled', !cur);\nnode.warn('FaCoS trace ' + (!cur ? 'ENABLED' : 'DISABLED'));\nreturn null;\n",
+        "outputs": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 420,
+        "y": 260,
+        "wires": []
+    },
+    {
         "id": "953ba978a781e9fe",
         "type": "tcp in",
         "z": "ae42528ac326c82b",
@@ -15,308 +275,61 @@
         "base64": false,
         "tls": "",
         "x": 180,
-        "y": 1040,
+        "y": 360,
         "wires": [
             [
-                "199f8c9cd04f45a5",
-                "5881aa124fa19c8b"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
     {
-        "id": "4ef3a04d62310bcf",
-        "type": "debug",
+        "id": "fa1e6a01b0f10001",
+        "type": "function",
         "z": "ae42528ac326c82b",
-        "name": "output",
-        "active": false,
-        "tosidebar": true,
-        "console": false,
-        "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
-        "statusVal": "",
-        "statusType": "auto",
-        "x": 1520,
-        "y": 230,
-        "wires": []
-    },
-    {
-        "id": "199f8c9cd04f45a5",
-        "type": "switch",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "property": "payload",
-        "propertyType": "msg",
-        "rules": [
-            {
-                "t": "cont",
-                "v": "get(1,info)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "queryObjects(26,ports)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1,status)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(1,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(26,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(200,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "set(1,go)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(200,state)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(200,railcom[0])",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "queryObjects(10,name)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1000,symbol)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1000,addr,protocol,symbol,speedindicator)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1000,funcsymbol[0],funcsymbol[1],funcsymbol[2],funcsymbol[3],funcsymbol[4],funcsymbol[5],funcsymbol[6],funcsymbol[7],funcsymbol[8])",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1000,funcsymbol[9],funcsymbol[10],funcsymbol[11],funcsymbol[12],funcsymbol[13],funcsymbol[14],funcsymbol[15])",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(10,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(1000,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(1000,control,force)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(1000,control)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "set(1000,dir[0])",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "set(1000,dir[1])",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(1,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(26,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "set(1,stop)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(200,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "get(1000)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(10,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "request(11,view,viewswitch)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "set(11,switch",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "speedstep",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(11,view)",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "func",
-                "vt": "str"
-            },
-            {
-                "t": "cont",
-                "v": "release(1000,view)",
-                "vt": "str"
-            },
-            {
-                "t": "else"
-            }
-        ],
-        "checkall": "true",
-        "repair": false,
-        "outputs": 33,
-        "x": 360,
-        "y": 1040,
+        "name": "framer (per-session line buf)",
+        "func": "\nconst sid = (msg._session && msg._session.id) || 'default';\nlet bag = flow.get('facosBuf');\nif (!bag) { bag = {}; flow.set('facosBuf', bag); }\nconst prev = bag[sid] || '';\nconst combined = prev + String(msg.payload);\nconst parts = combined.split('\\n');\nconst tail = parts.pop();\nbag[sid] = tail;\nconst out = [];\nfor (const p of parts) {\n  const cleaned = p.replace(/\\r+$/, '').trim();\n  if (!cleaned) continue;\n  out.push({ _session: msg._session, payload: cleaned });\n}\nreturn [out];\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 400,
+        "y": 360,
         "wires": [
             [
-                "64a7bdb6d7f60da0"
+                "fa1e6a01b0f10002"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10002",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "parser/dispatcher/formatter",
+        "func": "\n// FaCoS ECoS PC-Interface command parser.\n//\n// Single source of truth for tokenizing, dispatching, and formatting replies\n// for the ESU PC-Interface protocol (spec v0.2 / §7) plus the JMRI / Rocrail\n// superset that real clients emit on the wire.\n//\n// Two consumers:\n//   1. `tests/parser-unit.js` `require()`s this directly under Node.\n//   2. `flow.json`'s parser function node has this file's body inlined verbatim\n//      (the function-node body strips the trailing `module.exports` block).\n//\n// The handler signature is intentionally pure: it takes (rawFrame, sessionId,\n// state) and returns { reply, sideEffects, events, raw, parsed }. The flow\n// node mutates `state` (which is the `flow.facos` flow-context object) in\n// place, then routes the returned arrays to the side-effect / fan-out wires.\n\n// -- Error codes (spec §5 + JMRI's NetworkErrorCodes table) --\nconst ERR = {\n  OK:              { code: 0,  name: 'OK' },\n  BADPARAMETER:    { code: 15, name: 'NERROR_BADPARAMETER' },\n  NOOBJECT:        { code: 19, name: 'NERROR_NOOBJECT' },\n  NOPARAMETER:     { code: 20, name: 'NERROR_NOPARAMETER' },\n  NOCONTROL:       { code: 25, name: 'NERROR_NOCONTROL' },\n  NOAPPEND:        { code: 27, name: 'NERROR_NOAPPEND' },\n  NOAPPEND35:      { code: 35, name: 'NERROR_NOAPPEND' },\n};\n\nconst VALID_PROTOCOLS = new Set([\n  'MM14', 'MM27', 'MM28', 'DCC14', 'DCC28', 'DCC128', 'SX32', 'MMFKT',\n]);\n\n// -------------------------------------------------------------------------\n// Tokenizer / parser\n// -------------------------------------------------------------------------\n// Grammar (per ESU spec §5):\n//   command   := name '(' id (',' option)* ')'\n//   option    := name | name '[' arg (',' arg)* ']'\n//   arg       := bareword | quoted\n//   quoted    := '\"' (any | '\"\"')* '\"'\n//\n// Whitespace inside parens is permitted. iTrain emits no whitespace; JMRI\n// emits ', '. Both must round-trip.\n//\n// `tokenize` returns { cmd, id, options } or throws SyntaxError. The error\n// message is propagated as `<END 15 (NERROR_BADPARAMETER)>` by the caller.\n\nfunction tokenize(input) {\n  if (typeof input !== 'string') {\n    throw new SyntaxError('input must be string');\n  }\n  const s = input.replace(/[\\r\\n]+$/, '');\n  let i = 0;\n\n  function skipSpace() {\n    while (i < s.length && (s[i] === ' ' || s[i] === '\\t')) i++;\n  }\n\n  skipSpace();\n  let cmd = '';\n  while (i < s.length && /[A-Za-z]/.test(s[i])) cmd += s[i++];\n  if (!cmd) throw new SyntaxError('missing command name');\n  skipSpace();\n  if (s[i] !== '(') throw new SyntaxError(\"expected '('\");\n  i++;\n  skipSpace();\n\n  let idStr = '';\n  while (i < s.length && /[0-9]/.test(s[i])) idStr += s[i++];\n  if (!idStr) throw new SyntaxError('missing id');\n  const id = parseInt(idStr, 10);\n  skipSpace();\n\n  const options = [];\n  while (s[i] === ',') {\n    i++;\n    skipSpace();\n    let name = '';\n    while (i < s.length && /[A-Za-z0-9_]/.test(s[i])) name += s[i++];\n    if (!name) throw new SyntaxError('missing option name');\n    skipSpace();\n    const args = [];\n    if (s[i] === '[') {\n      i++;\n      skipSpace();\n      if (s[i] === ']') {\n        i++;\n      } else {\n        while (true) {\n          let arg;\n          if (s[i] === '\"') {\n            i++;\n            let str = '';\n            while (i < s.length) {\n              if (s[i] === '\"') {\n                if (s[i + 1] === '\"') { str += '\"'; i += 2; continue; }\n                i++;\n                break;\n              }\n              str += s[i++];\n            }\n            arg = { kind: 'string', value: str };\n          } else {\n            let raw = '';\n            while (i < s.length && s[i] !== ',' && s[i] !== ']') raw += s[i++];\n            raw = raw.trim();\n            if (raw === '') throw new SyntaxError('empty arg');\n            arg = { kind: 'token', value: raw };\n          }\n          args.push(arg);\n          skipSpace();\n          if (s[i] === ',') { i++; skipSpace(); continue; }\n          if (s[i] === ']') { i++; break; }\n          throw new SyntaxError(\"expected ',' or ']' in args\");\n        }\n      }\n      skipSpace();\n    }\n    options.push({ name, args });\n    skipSpace();\n  }\n  if (s[i] !== ')') throw new SyntaxError(\"expected ')'\");\n  i++;\n  skipSpace();\n  if (i !== s.length) throw new SyntaxError('trailing content after )');\n  return { cmd, id, options };\n}\n\n// -------------------------------------------------------------------------\n// Reply formatter\n// -------------------------------------------------------------------------\n// Every reply has the shape\n//   <REPLY <raw>>\\n\n//   <body lines, each ending in \\n>\n//   <END N (NAME)>\\n\n// `formatReply` accepts the original raw frame so the echo is byte-identical\n// to the client's command (iTrain sends no whitespace, JMRI sends ', ' — both\n// must round-trip exactly).\n\nfunction formatReply(raw, body, err) {\n  err = err || ERR.OK;\n  const lines = [`<REPLY ${raw}>`];\n  if (body && body.length) {\n    for (const ln of body) lines.push(ln);\n  }\n  lines.push(`<END ${err.code} (${err.name})>`);\n  return lines.join('\\n') + '\\n';\n}\n\nfunction formatEvent(objectId, body) {\n  const lines = [`<EVENT ${objectId}>`];\n  if (body && body.length) {\n    for (const ln of body) lines.push(ln);\n  }\n  lines.push('<END 0 (OK)>');\n  return lines.join('\\n') + '\\n';\n}\n\n// Render a JS value back to its on-the-wire form.\n//   string  -> \"...\"  with embedded \"  doubled\n//   number  -> as-is\n//   boolean -> 0 / 1\nfunction fmtArg(v) {\n  if (typeof v === 'string') {\n    return '\"' + v.replace(/\"/g, '\"\"') + '\"';\n  }\n  if (typeof v === 'boolean') return v ? '1' : '0';\n  return String(v);\n}\n\n// -------------------------------------------------------------------------\n// idClass: classify an id into its handler bucket.\n// -------------------------------------------------------------------------\nfunction idClass(id) {\n  if (id === 1)  return 'ecos';\n  if (id === 5)  return 'progGleis';\n  if (id === 10) return 'lokmgr';\n  if (id === 11) return 'swmgr';\n  if (id === 12) return 'pendelmgr';\n  if (id === 20) return 'devmgr';\n  if (id === 25) return 'sniffer';\n  if (id === 26) return 'fbmgr';\n  if (id === 27) return 'booster';\n  if (id === 31) return 'stellpult';\n  if (id >= 100 && id <= 163) return 's88';\n  if (id >= 200 && id <= 299) return 'ecosDetector';\n  if (id >= 1000 && id < 20000) return 'lok';\n  if (id >= 20000) return 'accessory';\n  return null;\n}\n\n// -------------------------------------------------------------------------\n// State helpers\n// -------------------------------------------------------------------------\nfunction defaultState() {\n  return {\n    status: 'GO',\n    info: {\n      ecos: 'ECoS',\n      protocolVersion: '0.5',\n      applicationVersion: '4.2.13',\n      hardwareVersion: '2.1',\n      id: 0,\n    },\n    loks: {\n      1000: makeLok({\n        id: 1000, addr: 3, name: 'Fake Locomotive 1000', protocol: 'DCC28',\n      }),\n    },\n    accessories: {},\n    s88Modules: {},\n    ecosDetectors: {\n      200: { id: 200, ports: 2, state: 0, railcom: {} },\n    },\n    views: {},\n    controls: {},\n    nextLokId: 1001,\n    nextAccessoryId: 20001,\n    layout: { accessories: {}, feedback: {}, loks: {} },\n  };\n}\n\nfunction makeLok(opts) {\n  return {\n    id: opts.id,\n    addr: opts.addr,\n    name: opts.name,\n    protocol: opts.protocol,\n    speed: 0,\n    speedstep: 0,\n    dir: 0,\n    funcs: {},\n    funcdescs: {},\n    cvs: {},\n    favorit: 0,\n    sniffer: 0,\n    speedindicator: 0,\n    profile: '',\n    locodesc: { imagetype: 'IMAGE_TYPE_INT', imageindex: 0 },\n    symbol: 0,\n  };\n}\n\nfunction ensureView(state, objectId, sessionId) {\n  if (!state.views[objectId]) state.views[objectId] = [];\n  if (state.views[objectId].indexOf(sessionId) === -1) state.views[objectId].push(sessionId);\n}\n\nfunction dropView(state, objectId, sessionId) {\n  const v = state.views[objectId];\n  if (!v) return;\n  const idx = v.indexOf(sessionId);\n  if (idx !== -1) v.splice(idx, 1);\n}\n\nfunction viewersOf(state, objectId) {\n  return (state.views[objectId] || []).slice();\n}\n\n// -------------------------------------------------------------------------\n// Handlers\n// -------------------------------------------------------------------------\n// Each handler returns { body, err, sideEffects, events }. Caller wraps with\n// formatReply.\n\nfunction err(code, body) { return { body: body || [], err: code }; }\nfunction ok(body) { return { body: body || [], err: ERR.OK }; }\n\nfunction tokVal(arg) { return arg && arg.value; }\n\n// ---- id=1 ECoS ----\nfunction handleEcos(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 1, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 1, sessionId);\n    return ok();\n  }\n  if (cmd === 'set') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const op = options[0].name;\n    if (op === 'go' || op === 'stop' || op === 'shutdown') {\n      const next = op.toUpperCase();\n      const transition = state.status !== next;\n      state.status = next;\n      const events = [];\n      const viewers = viewersOf(state, 1);\n      if (transition && viewers.length) {\n        events.push({\n          subscribers: viewers,\n          payload: formatEvent(1, [`1 status[${next}]`]),\n        });\n      }\n      return { body: [], err: ERR.OK, events };\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    let bad = false;\n    for (const o of options) {\n      if (o.name === 'info') {\n        body.push(`1 ${state.info.ecos}`);\n        body.push(`1 ProtocolVersion[${state.info.protocolVersion}]`);\n        body.push(`1 ApplicationVersion[${state.info.applicationVersion}]`);\n        body.push(`1 HardwareVersion[${state.info.hardwareVersion}]`);\n      } else if (o.name === 'status') {\n        body.push(`1 status[${state.status}]`);\n      } else if (o.name === 'id') {\n        body.push(`1 id[${state.info.id}]`);\n      } else {\n        bad = true; break;\n      }\n    }\n    if (bad) return err(ERR.BADPARAMETER);\n    return ok(body);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- id=10 LokManager ----\nfunction handleLokMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 10, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 10, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      return ok([`10 size[${Object.keys(state.loks).length}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    return ok(queryLoks(state, options));\n  }\n  if (cmd === 'create') {\n    return createLok(state, options);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction lokInRange(lok, min, max) {\n  return lok.id >= min && lok.id <= max;\n}\n\nfunction queryLoks(state, options) {\n  let nrFilter = null;\n  const fields = [];\n  for (const o of options) {\n    if (o.name === 'nr') {\n      const a = o.args.map(tokVal).map(Number);\n      if (a.length === 2 && Number.isFinite(a[0]) && Number.isFinite(a[1])) nrFilter = [a[0], a[1]];\n    } else if (o.name === 'name' || o.name === 'addr' || o.name === 'protocol') {\n      fields.push(o.name);\n    }\n  }\n  const ids = Object.keys(state.loks).map(Number).sort((a, b) => a - b);\n  const out = [];\n  for (const id of ids) {\n    const lok = state.loks[id];\n    if (nrFilter && !lokInRange(lok, nrFilter[0], nrFilter[1])) continue;\n    if (!fields.length) {\n      out.push(`${lok.id}`);\n    } else {\n      const parts = [`${lok.id}`];\n      for (const f of fields) {\n        if (f === 'name') parts.push(`name[${fmtArg(lok.name)}]`);\n        else if (f === 'addr') parts.push(`addr[${lok.addr}]`);\n        else if (f === 'protocol') parts.push(`protocol[${lok.protocol}]`);\n      }\n      out.push(parts.join(' '));\n    }\n  }\n  return out;\n}\n\nfunction createLok(state, options) {\n  const append = options.some(o => o.name === 'append');\n  const discard = options.some(o => o.name === 'discard');\n  if (!append && !discard) return err(ERR.NOAPPEND);\n  if (discard) return ok();\n  const init = { id: state.nextLokId++, addr: 0, name: '', protocol: 'DCC28' };\n  for (const o of options) {\n    if (o.name === 'addr' && o.args.length) init.addr = Number(tokVal(o.args[0]));\n    if (o.name === 'name' && o.args.length) init.name = String(tokVal(o.args[0]));\n    if (o.name === 'protocol' && o.args.length) {\n      const p = String(tokVal(o.args[0]));\n      if (!VALID_PROTOCOLS.has(p)) return err(ERR.BADPARAMETER);\n      init.protocol = p;\n    }\n  }\n  const lok = makeLok(init);\n  state.loks[lok.id] = lok;\n  const body = [`${lok.id}`];\n  return { body, err: ERR.OK, events: [{\n    subscribers: viewersOf(state, 10),\n    payload: formatEvent(10, ['10 msg[LIST_CHANGED]']),\n  }] };\n}\n\n// ---- id=11 SchaltartikelManager ----\nfunction handleSwMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    const wantsView = options.some(o => o.name === 'view');\n    if (!wantsView) return err(ERR.BADPARAMETER);\n    ensureView(state, 11, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    if (!wantsView) return err(ERR.BADPARAMETER);\n    dropView(state, 11, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      return ok([`11 size[${Object.keys(state.accessories).length}]`]);\n    }\n    if (options.length && options[0].name === 'switch') {\n      const a = options[0].args[0];\n      if (!a) return err(ERR.NOPARAMETER);\n      const parsed2 = parseSwitchArg(tokVal(a));\n      if (!parsed2) return err(ERR.BADPARAMETER);\n      const key = `${parsed2.protocol}${parsed2.addr}`;\n      const acc = state.accessoriesByAddr ? state.accessoriesByAddr[key] : null;\n      const wire = acc ? acc.wire : null;\n      if (!wire) return err(ERR.NOOBJECT);\n      return ok([`11 switch[${parsed2.protocol}${parsed2.addr}${wire}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'set') {\n    if (options.length && options[0].name === 'switch') {\n      const a = options[0].args[0];\n      if (!a) return err(ERR.NOPARAMETER);\n      const parsed2 = parseSwitchArg(tokVal(a));\n      if (!parsed2) return err(ERR.BADPARAMETER);\n      if (!state.accessoriesByAddr) state.accessoriesByAddr = {};\n      const key = `${parsed2.protocol}${parsed2.addr}`;\n      state.accessoriesByAddr[key] = { ...parsed2 };\n      const events = [{\n        subscribers: viewersOf(state, 11),\n        payload: formatEvent(11, [`11 switch[${parsed2.protocol}${parsed2.addr}${parsed2.wire}]`]),\n      }];\n      const sideEffects = [{\n        kind: 'switch',\n        protocol: parsed2.protocol,\n        addr: parsed2.addr,\n        wire: parsed2.wire,\n      }];\n      return { body: [], err: ERR.OK, events, sideEffects };\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    const ids = Object.keys(state.accessories).map(Number).sort((a, b) => a - b);\n    return ok(ids.map(id => `${id}`));\n  }\n  if (cmd === 'create') {\n    const append = options.some(o => o.name === 'append');\n    const discard = options.some(o => o.name === 'discard');\n    if (!append && !discard) return err(ERR.NOAPPEND);\n    if (discard) return ok();\n    const id = state.nextAccessoryId++;\n    state.accessories[id] = { id, addr: 0, addrext: 0, protocol: 'DCC',\n      mode: 'SWITCH', duration: 250, name1: '', name2: '', name3: '',\n      symbol: 0, state: 0 };\n    return ok([`${id}`]);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction parseSwitchArg(s) {\n  if (!s) return null;\n  const m = /^(MOT|DCC)(\\d+)([rg])$/.exec(s);\n  if (!m) return null;\n  return { protocol: m[1], addr: parseInt(m[2], 10), wire: m[3] };\n}\n\n// ---- id=26 Feedback-Manager ----\nfunction handleFbMgr(parsed, sessionId, state) {\n  const { cmd, options } = parsed;\n  if (cmd === 'request') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    ensureView(state, 26, sessionId);\n    return ok();\n  }\n  if (cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    dropView(state, 26, sessionId);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (options.length && options[0].name === 'size') {\n      const n = Object.keys(state.s88Modules).length + Object.keys(state.ecosDetectors).length;\n      return ok([`26 size[${n}]`]);\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  if (cmd === 'queryObjects') {\n    const wantPorts = options.some(o => o.name === 'ports');\n    const out = [];\n    const s88Ids = Object.keys(state.s88Modules).map(Number).sort((a, b) => a - b);\n    for (const id of s88Ids) {\n      const m = state.s88Modules[id];\n      out.push(wantPorts ? `${id} ports[${m.ports}]` : `${id}`);\n    }\n    const detIds = Object.keys(state.ecosDetectors).map(Number).sort((a, b) => a - b);\n    for (const id of detIds) {\n      const d = state.ecosDetectors[id];\n      out.push(wantPorts ? `${id} ports[${d.ports}]` : `${id}`);\n    }\n    return ok(out);\n  }\n  if (cmd === 'create') {\n    const add = options.find(o => o.name === 'add');\n    if (!add) return err(ERR.BADPARAMETER);\n    const args = add.args.map(tokVal).map(Number);\n    if (args.length < 2) return err(ERR.BADPARAMETER);\n    const pos = args[0];\n    const ports = args[1];\n    const id = 100 + pos;\n    if (id < 100 || id > 163) return err(ERR.BADPARAMETER);\n    state.s88Modules[id] = { id, ports, state: 0 };\n    return ok([`${id}`]);\n  }\n  if (cmd === 'delete') {\n    const del = options.find(o => o.name === 'del');\n    if (!del) return err(ERR.BADPARAMETER);\n    const pos = Number(tokVal(del.args[0]));\n    const id = 100 + pos;\n    if (state.s88Modules[id]) delete state.s88Modules[id];\n    return ok();\n  }\n  if (cmd === 'set') {\n    if (options.length && options[0].name === 'size') {\n      // accepted but no-op\n      return ok();\n    }\n    return err(ERR.BADPARAMETER);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- id≥1000 Lok ----\nfunction handleLok(parsed, sessionId, state) {\n  const { cmd, id, options } = parsed;\n  const lok = state.loks[id];\n  if (!lok) {\n    // delete on a missing lok still NOOBJECT.\n    return err(ERR.NOOBJECT);\n  }\n  if (cmd === 'request') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    const force = options.some(o => o.name === 'force');\n    if (wantsView) ensureView(state, id, sessionId);\n    if (wantsControl) {\n      const cur = state.controls[id];\n      if (cur && cur !== sessionId && !force) return err(ERR.NOCONTROL);\n      state.controls[id] = sessionId;\n    }\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    if (wantsView) dropView(state, id, sessionId);\n    if (wantsControl && state.controls[id] === sessionId) state.controls[id] = null;\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'get') return getLokFields(lok, id, options);\n  if (cmd === 'set') return setLokFields(state, lok, id, sessionId, options);\n  if (cmd === 'delete') {\n    delete state.loks[id];\n    return { body: [], err: ERR.OK, events: [{\n      subscribers: viewersOf(state, 10),\n      payload: formatEvent(10, ['10 msg[LIST_CHANGED]']),\n    }] };\n  }\n  if (cmd === 'link' || cmd === 'unlink') {\n    return ok();\n  }\n  if (cmd === 'queryObjects') {\n    return ok([]);\n  }\n  return err(ERR.BADPARAMETER);\n}\n\nfunction getLokFields(lok, id, options) {\n  if (!options.length) return ok();\n  const body = [];\n  for (const o of options) {\n    const v = readLokField(lok, o);\n    if (v == null) return err(ERR.BADPARAMETER);\n    body.push(`${id} ${v}`);\n  }\n  return ok(body);\n}\n\nfunction readLokField(lok, o) {\n  switch (o.name) {\n    case 'addr':           return `addr[${lok.addr}]`;\n    case 'name':           return `name[${fmtArg(lok.name)}]`;\n    case 'protocol':       return `protocol[${lok.protocol}]`;\n    case 'speed':          return `speed[${lok.speed}]`;\n    case 'speedstep':      return `speedstep[${lok.speedstep}]`;\n    case 'dir':            return `dir[${lok.dir}]`;\n    case 'favorit':        return `favorit[${lok.favorit}]`;\n    case 'sniffer':        return `sniffer[${lok.sniffer}]`;\n    case 'speedindicator': return `speedindicator[${lok.speedindicator}]`;\n    case 'profile':        return `profile[${fmtArg(lok.profile)}]`;\n    case 'symbol':\n    case 'funcsymbol': {\n      const idx = o.args.length ? Number(tokVal(o.args[0])) : 0;\n      const v = lok.funcs[idx] || 0;\n      return `func[${idx}, ${v}]`;\n    }\n    case 'func': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      if (!Number.isFinite(idx)) return null;\n      const v = lok.funcs[idx] || 0;\n      return `func[${idx}, ${v}]`;\n    }\n    case 'funcdesc': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      const d = lok.funcdescs[idx];\n      if (!d) return `funcdesc[${idx}, 0]`;\n      return `funcdesc[${idx}, ${d.code}${d.moment ? ', moment' : ''}]`;\n    }\n    case 'funcexists': {\n      if (!o.args.length) return null;\n      const idx = Number(tokVal(o.args[0]));\n      const exists = (lok.funcs[idx] !== undefined) || (lok.funcdescs[idx] !== undefined);\n      return `funcexists[${idx}, ${exists ? 1 : 0}]`;\n    }\n    case 'cv': {\n      if (o.args.length !== 1) return null;\n      const nr = Number(tokVal(o.args[0]));\n      const v = lok.cvs[nr];\n      if (v == null) return null;\n      return `cv[${nr}, ${v}]`;\n    }\n    case 'locodesc': {\n      const ld = lok.locodesc;\n      return `locodesc[${ld.imagetype}, ${ld.imageindex}]`;\n    }\n    default: return null;\n  }\n}\n\nfunction setLokFields(state, lok, id, sessionId, options) {\n  // Spec §5: set without control normally fails; iTrain skips request(control).\n  // Be lenient: only enforce control when a control owner is set and it's not us.\n  const owner = state.controls[id];\n  if (owner && owner !== sessionId) return err(ERR.NOCONTROL);\n  const sideEffects = [];\n  let speedTouched = false;\n  let dirTouched = false;\n  let funcTouched = null; // index that changed\n  for (const o of options) {\n    if (o.name === 'stop') {\n      lok.speed = 0; lok.speedstep = 0;\n      speedTouched = true;\n    } else if (o.name === 'speed' || o.name === 'speedstep') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const v = Number(tokVal(o.args[0]));\n      if (!Number.isFinite(v)) return err(ERR.BADPARAMETER);\n      lok[o.name] = v;\n      speedTouched = true;\n    } else if (o.name === 'dir') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const v = Number(tokVal(o.args[0]));\n      if (v !== 0 && v !== 1) return err(ERR.BADPARAMETER);\n      lok.dir = v;\n      dirTouched = true;\n    } else if (o.name === 'addr') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.addr = Number(tokVal(o.args[0]));\n    } else if (o.name === 'name') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.name = String(tokVal(o.args[0]));\n    } else if (o.name === 'protocol') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      const p = String(tokVal(o.args[0]));\n      if (!VALID_PROTOCOLS.has(p)) return err(ERR.BADPARAMETER);\n      lok.protocol = p;\n    } else if (o.name === 'func') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const idx = Number(tokVal(o.args[0]));\n      const v = Number(tokVal(o.args[1]));\n      if (!Number.isFinite(idx)) return err(ERR.BADPARAMETER);\n      lok.funcs[idx] = v;\n      funcTouched = idx;\n    } else if (o.name === 'funcdesc') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const idx = Number(tokVal(o.args[0]));\n      const code = Number(tokVal(o.args[1]));\n      const moment = o.args.length >= 3 && tokVal(o.args[2]) === 'moment';\n      lok.funcdescs[idx] = { code, moment };\n    } else if (o.name === 'cv') {\n      if (o.args.length < 2) return err(ERR.NOPARAMETER);\n      const nr = Number(tokVal(o.args[0]));\n      const v = Number(tokVal(o.args[1]));\n      lok.cvs[nr] = v;\n    } else if (o.name === 'favorit' || o.name === 'sniffer' || o.name === 'speedindicator') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok[o.name] = Number(tokVal(o.args[0]));\n    } else if (o.name === 'profile') {\n      if (!o.args.length) return err(ERR.NOPARAMETER);\n      lok.profile = String(tokVal(o.args[0]));\n    } else if (o.name === 'symbol' || o.name === 'funcsymbol') {\n      // legacy aliases - swallow without error\n    } else {\n      return err(ERR.BADPARAMETER);\n    }\n  }\n  // MQTT side-effect for speed/dir mutations on our motor wire.\n  if (speedTouched || dirTouched) {\n    sideEffects.push({\n      kind: 'lokSpeed',\n      lokId: id,\n      addr: lok.addr,\n      speed: lok.speedstep || lok.speed || 0,\n      dir: lok.dir,\n    });\n  }\n  const events = [];\n  const viewers = viewersOf(state, id);\n  if (viewers.length) {\n    const lines = [];\n    if (speedTouched) lines.push(`${id} speedstep[${lok.speedstep}]`);\n    if (dirTouched) lines.push(`${id} dir[${lok.dir}]`);\n    if (funcTouched !== null) lines.push(`${id} func[${funcTouched}, ${lok.funcs[funcTouched]}]`);\n    if (lines.length) {\n      events.push({ subscribers: viewers, payload: formatEvent(id, lines) });\n    }\n  }\n  return { body: [], err: ERR.OK, sideEffects, events };\n}\n\n// ---- id≥20000 Schaltartikel object form (JMRI) ----\nfunction handleAccessory(parsed, sessionId, state) {\n  const { cmd, id, options } = parsed;\n  const acc = state.accessories[id];\n  if (!acc) return err(ERR.NOOBJECT);\n  if (cmd === 'request' || cmd === 'release') {\n    const wantsView = options.some(o => o.name === 'view');\n    const wantsControl = options.some(o => o.name === 'control');\n    if (wantsView) (cmd === 'request' ? ensureView : dropView)(state, id, sessionId);\n    if (wantsControl) {\n      if (cmd === 'request') state.controls[id] = sessionId;\n      else if (state.controls[id] === sessionId) state.controls[id] = null;\n    }\n    if (!wantsView && !wantsControl) return err(ERR.BADPARAMETER);\n    return ok();\n  }\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    for (const o of options) {\n      switch (o.name) {\n        case 'state':    body.push(`${id} state[${acc.state}]`); break;\n        case 'addr':     body.push(`${id} addr[${acc.addr}]`); break;\n        case 'addrext':  body.push(`${id} addrext[${acc.addrext}]`); break;\n        case 'protocol': body.push(`${id} protocol[${acc.protocol}]`); break;\n        case 'name1':    body.push(`${id} name1[${fmtArg(acc.name1)}]`); break;\n        case 'name2':    body.push(`${id} name2[${fmtArg(acc.name2)}]`); break;\n        case 'name3':    body.push(`${id} name3[${fmtArg(acc.name3)}]`); break;\n        case 'symbol':   body.push(`${id} symbol[${acc.symbol}]`); break;\n        case 'mode':     body.push(`${id} mode[${acc.mode}]`); break;\n        case 'duration': body.push(`${id} duration[${acc.duration}]`); break;\n        default: return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok(body);\n  }\n  if (cmd === 'set') {\n    for (const o of options) {\n      switch (o.name) {\n        case 'state':    acc.state    = Number(tokVal(o.args[0])); break;\n        case 'addr':     acc.addr     = Number(tokVal(o.args[0])); break;\n        case 'addrext':  acc.addrext  = Number(tokVal(o.args[0])); break;\n        case 'protocol': acc.protocol = String(tokVal(o.args[0])); break;\n        case 'name1':    acc.name1    = String(tokVal(o.args[0])); break;\n        case 'name2':    acc.name2    = String(tokVal(o.args[0])); break;\n        case 'name3':    acc.name3    = String(tokVal(o.args[0])); break;\n        case 'symbol':   acc.symbol   = Number(tokVal(o.args[0])); break;\n        case 'mode':     acc.mode     = String(tokVal(o.args[0])); break;\n        case 'duration': acc.duration = Number(tokVal(o.args[0])); break;\n        default: return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok();\n  }\n  if (cmd === 'delete') {\n    delete state.accessories[id];\n    return ok();\n  }\n  if (cmd === 'link' || cmd === 'unlink') return ok();\n  if (cmd === 'queryObjects') return ok([]);\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- s88 (id 100..163) and ECoSDetector (id 200+) ----\nfunction handleS88(parsed, sessionId, state) {\n  return handleFeedbackModule(parsed, sessionId, state, 's88');\n}\nfunction handleEcosDetector(parsed, sessionId, state) {\n  return handleFeedbackModule(parsed, sessionId, state, 'ecosDetector');\n}\n\nfunction handleFeedbackModule(parsed, sessionId, state, kind) {\n  const { cmd, id, options } = parsed;\n  const bag = kind === 's88' ? state.s88Modules : state.ecosDetectors;\n  let mod = bag[id];\n  if (cmd === 'request' || cmd === 'release') {\n    if (!options.length || options[0].name !== 'view') return err(ERR.BADPARAMETER);\n    if (!mod) return err(ERR.NOOBJECT);\n    (cmd === 'request' ? ensureView : dropView)(state, id, sessionId);\n    return ok();\n  }\n  if (!mod) return err(ERR.NOOBJECT);\n  if (cmd === 'get') {\n    if (!options.length) return err(ERR.NOPARAMETER);\n    const body = [];\n    for (const o of options) {\n      if (o.name === 'state') {\n        const hex = '0x' + mod.state.toString(16);\n        body.push(`${id} state[${hex}]`);\n      } else if (o.name === 'ports') {\n        body.push(`${id} ports[${mod.ports}]`);\n      } else if (o.name === 'railcom') {\n        const port = o.args.length ? Number(tokVal(o.args[0])) : 0;\n        const rc = (mod.railcom || {})[port] || { addr: 0, dir: 0 };\n        const portStr = String(port).padStart(2, '0');\n        const addrStr = String(rc.addr).padStart(4, '0');\n        body.push(`${id} railcom[${portStr}, ${addrStr}, ${rc.dir}]`);\n      } else {\n        return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok(body);\n  }\n  if (cmd === 'set') {\n    for (const o of options) {\n      if (o.name === 'ports' && o.args.length) mod.ports = Number(tokVal(o.args[0]));\n      else if (o.name === 'state' && o.args.length) {\n        const v = String(tokVal(o.args[0]));\n        mod.state = v.startsWith('0x') ? parseInt(v.slice(2), 16) : parseInt(v, 10);\n      } else {\n        return err(ERR.BADPARAMETER);\n      }\n    }\n    return ok();\n  }\n  if (cmd === 'delete') {\n    if (kind !== 's88') return err(ERR.BADPARAMETER);\n    delete state.s88Modules[id];\n    return ok();\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- Stub handlers for in-Planung sections ----\nfunction handleStub(parsed, sessionId, state) {\n  const { cmd } = parsed;\n  if (cmd === 'request' || cmd === 'release' || cmd === 'set' ||\n      cmd === 'get' || cmd === 'queryObjects' || cmd === 'create' ||\n      cmd === 'delete' || cmd === 'link' || cmd === 'unlink') {\n    return ok();\n  }\n  return err(ERR.BADPARAMETER);\n}\n\n// ---- Top-level dispatch ----\nconst DISPATCH = {\n  ecos:         handleEcos,\n  lokmgr:       handleLokMgr,\n  swmgr:        handleSwMgr,\n  fbmgr:        handleFbMgr,\n  lok:          handleLok,\n  accessory:    handleAccessory,\n  s88:          handleS88,\n  ecosDetector: handleEcosDetector,\n  progGleis:    handleStub,\n  pendelmgr:    handleStub,\n  devmgr:       handleStub,\n  sniffer:      handleStub,\n  booster:      handleStub,\n  stellpult:    handleStub,\n};\n\n// `handle` is the public entry point. `raw` is one complete frame (no\n// trailing newline). `sessionId` is `msg._session.id`. `state` is the live\n// `flow.facos` object — handlers mutate it in place.\nfunction handle(raw, sessionId, state) {\n  const cleaned = String(raw).replace(/[\\r\\n]+$/, '').trim();\n  if (!cleaned) return null;\n  let parsed;\n  try {\n    parsed = tokenize(cleaned);\n  } catch (e) {\n    return {\n      raw: cleaned,\n      parsed: null,\n      reply: formatReply(cleaned, [], ERR.BADPARAMETER),\n      sideEffects: [],\n      events: [],\n    };\n  }\n  const klass = idClass(parsed.id);\n  if (!klass) {\n    return {\n      raw: cleaned,\n      parsed,\n      reply: formatReply(cleaned, [], ERR.NOOBJECT),\n      sideEffects: [],\n      events: [],\n    };\n  }\n  const fn = DISPATCH[klass];\n  let result;\n  try {\n    result = fn(parsed, sessionId, state);\n  } catch (e) {\n    return {\n      raw: cleaned,\n      parsed,\n      reply: formatReply(cleaned, [], ERR.BADPARAMETER),\n      sideEffects: [],\n      events: [],\n      error: e.message,\n    };\n  }\n  return {\n    raw: cleaned,\n    parsed,\n    reply: formatReply(cleaned, result.body || [], result.err || ERR.OK),\n    sideEffects: result.sideEffects || [],\n    events: result.events || [],\n  };\n}\n\n// -- TCP framer (per-session line buffer) --\n//\n// `feedFrame` accepts a chunk arriving on tcp in for a session and returns an\n// array of complete frames (no newline). It mutates `bufBag[sessionId]` for\n// stateful accumulation.\nfunction feedFrame(bufBag, sessionId, chunk) {\n  const prev = bufBag[sessionId] || '';\n  const combined = prev + String(chunk);\n  const parts = combined.split('\\n');\n  const tail = parts.pop();\n  bufBag[sessionId] = tail;\n  return parts.map(p => p.replace(/\\r+$/, ''));\n}\n\n\n\n// -- Function-node entry point --\nconst sessionId = (msg._session && msg._session.id) || 'default';\nlet state = flow.get('facos');\nif (!state) { state = defaultState(); flow.set('facos', state); }\n\nconst result = handle(msg.payload, sessionId, state);\nif (!result) { return null; }\n\nconst replyMsg = {\n  _session: msg._session,\n  payload: result.reply,\n  _facos: { raw: result.raw, summary: '<REPLY ' + result.raw + '> ' + (result.parsed && result.parsed.cmd) + ':' + (result.parsed && result.parsed.id) },\n};\n\nconst sideEffectMsgs = [];\nfor (const se of (result.sideEffects || [])) {\n  if (se.kind === 'switch') {\n    sideEffectMsgs.push({\n      raw:     { address: String(se.addr), wire: se.wire },\n      _facosKind: 'switch',\n    });\n  } else if (se.kind === 'lokSpeed') {\n    sideEffectMsgs.push({\n      raw:     { address: String(se.addr || se.lokId), speed: String(se.speed), dir: String(se.dir) },\n      _facosKind: 'lokSpeed',\n    });\n  }\n}\n\nconst eventMsgs = [];\nfor (const ev of (result.events || [])) {\n  for (const sid of (ev.subscribers || [])) {\n    eventMsgs.push({\n      _session: { type: 'tcp', id: sid },\n      payload: ev.payload,\n      _facos: { kind: 'event', summary: ev.payload.split('\\n')[0] },\n    });\n  }\n}\n\nconst traceMsg = {\n  payload: new Date().toISOString() + '\\t' + sessionId + '\\t' + JSON.stringify(result.raw) + '\\t' + (result.parsed ? result.parsed.cmd + ':' + result.parsed.id : 'PARSE_FAIL') + '\\n',\n  _facos: { kind: 'trace' },\n};\n\nconst unhandled = (!result.parsed || result.reply.indexOf('NERROR_BADPARAMETER') !== -1 || result.reply.indexOf('NERROR_NOOBJECT') !== -1)\n  ? { payload: { raw: result.raw, reply: result.reply, parsed: result.parsed } }\n  : null;\n\nreturn [replyMsg, sideEffectMsgs, eventMsgs, traceMsg, unhandled];\n",
+        "outputs": 5,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 360,
+        "wires": [
+            [
+                "0583f2c2bfaaf73d",
+                "fa1e6a01b0f1000d"
             ],
             [
-                "d6e1be7d7c5e48bb"
+                "fa1e6a01b0f10006"
             ],
             [
-                "41cefacfc3563b26"
+                "fa1e6a01b0f10007"
             ],
             [
-                "2307d02c12876114"
+                "fa1e6a01b0f1000d"
             ],
             [
-                "46f16d1300a72b06"
-            ],
-            [
-                "242ae27602d0810f"
-            ],
-            [
-                "baf07f2b289f12d0"
-            ],
-            [
-                "e0748d5396ebe4d3"
-            ],
-            [
-                "9debac24a19f5d7b"
-            ],
-            [
-                "fe94dfb5286fccee"
-            ],
-            [
-                "bb8d169645c41fb7"
-            ],
-            [
-                "6f2eb58e1d856f49"
-            ],
-            [
-                "c6cd5d2ec653d98a"
-            ],
-            [
-                "f94b28f9e3b0bae2"
-            ],
-            [
-                "0d12d2dd1ec63410"
-            ],
-            [
-                "8e802fca5dcfdbc0"
-            ],
-            [
-                "3065e96f7de3e530"
-            ],
-            [
-                "e85e1586765807f9"
-            ],
-            [
-                "19f6b7846b63fe49"
-            ],
-            [
-                "7665d429e7382ec6"
-            ],
-            [
-                "da58e79245819431"
-            ],
-            [
-                "d1fe31f59f05b690"
-            ],
-            [
-                "87c6cfb2a2521fa1"
-            ],
-            [
-                "a878731491a78c1e"
-            ],
-            [
-                "72ae4ff460e9c964"
-            ],
-            [
-                "9b8917ee04c95337"
-            ],
-            [
-                "d150813199646371"
-            ],
-            [
-                "27d8ff35b4e13404"
-            ],
-            [
-                "9937082b58bee53e"
-            ],
-            [
-                "eb50df68b1375919"
-            ],
-            [
-                "002df91de7366b64",
-                "f348fbea826c3c76"
-            ],
-            [
-                "3b65419fd4cf07a3"
-            ],
-            [
-                "cf6f04d2722aee44"
+                "fa1e6a01b0f1001c"
             ]
         ]
     },
@@ -330,32 +343,176 @@
         "beserver": "reply",
         "base64": false,
         "end": false,
-        "x": 1520,
-        "y": 280,
+        "x": 940,
+        "y": 340,
         "wires": []
     },
     {
-        "id": "64a7bdb6d7f60da0",
+        "id": "fa1e6a01b0f10006",
         "type": "function",
         "z": "ae42528ac326c82b",
-        "name": "get(1,info)",
-        "func": "msg.payload = '<REPLY get(1,info)>\\n' + \n'1 ECoS\\n' + \n'1 ProtocolVersion[0.999]\\n' + \n'1 ApplicationVersion[1.1.1]\\n' + \n'1 HardwareVersion[1.3]\\n' + \n'<END 0 (OK)>\\n';\nreturn msg;",
+        "name": "side-effects dispatch",
+        "func": "\nconst k = msg._facosKind;\nif (k === 'switch')   return [msg, null];\nif (k === 'lokSpeed') return [null, msg];\nreturn [null, null];\n",
+        "outputs": 2,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 880,
+        "y": 380,
+        "wires": [
+            [
+                "fa1e6a01b0f10025"
+            ],
+            [
+                "fa1e6a01b0f10024"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10025",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "switch -> raw",
+        "func": "\nmsg.payload = msg.raw;\ndelete msg.raw;\ndelete msg._facosKind;\ndelete msg._facos;\nreturn msg;\n",
         "outputs": 1,
         "noerr": 0,
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 830,
-        "y": 220,
+        "x": 1100,
+        "y": 360,
         "wires": [
             [
-                "b6e4f6de6c577084",
-                "572c3c875485f4fa"
+                "4e2cc9eb2ddadad8"
             ]
         ]
     },
     {
-        "id": "cf6f04d2722aee44",
+        "id": "fa1e6a01b0f10024",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "lokSpeed -> raw",
+        "func": "\nmsg.payload = msg.raw;\ndelete msg.raw;\ndelete msg._facosKind;\ndelete msg._facos;\nreturn msg;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1100,
+        "y": 400,
+        "wires": [
+            [
+                "24dc6b2d70f47d9e"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10007",
+        "type": "link out",
+        "z": "ae42528ac326c82b",
+        "name": "facos.events",
+        "mode": "link",
+        "links": [
+            "fa1e6a01b0f10008"
+        ],
+        "x": 880,
+        "y": 420,
+        "wires": []
+    },
+    {
+        "id": "fa1e6a01b0f10008",
+        "type": "link in",
+        "z": "ae42528ac326c82b",
+        "name": "facos.events.in",
+        "links": [
+            "fa1e6a01b0f10007",
+            "fa1e6a01b0f1000a"
+        ],
+        "x": 200,
+        "y": 460,
+        "wires": [
+            [
+                "fa1e6a01b0f10009"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f10009",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "event fan-out",
+        "func": "\nreturn msg;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 420,
+        "y": 460,
+        "wires": [
+            [
+                "0583f2c2bfaaf73d",
+                "fa1e6a01b0f1000d"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f1000d",
+        "type": "function",
+        "z": "ae42528ac326c82b",
+        "name": "trace gate",
+        "func": "\nconst enabled = flow.get('facosTraceEnabled');\nif (!enabled) return null;\nreturn msg;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 920,
+        "y": 540,
+        "wires": [
+            [
+                "fa1e6a01b0f1000c",
+                "fa1e6a01b0f1001b"
+            ]
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f1000c",
+        "type": "file",
+        "z": "ae42528ac326c82b",
+        "name": "cursor-scratch/facos-trace.log",
+        "filename": "cursor-scratch/facos-trace.log",
+        "filenameType": "str",
+        "appendNewline": true,
+        "createDir": true,
+        "overwriteFile": "false",
+        "encoding": "none",
+        "x": 1200,
+        "y": 520,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "fa1e6a01b0f1001b",
+        "type": "debug",
+        "z": "ae42528ac326c82b",
+        "name": "trace",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1180,
+        "y": 560,
+        "wires": []
+    },
+    {
+        "id": "fa1e6a01b0f1001c",
         "type": "debug",
         "z": "ae42528ac326c82b",
         "name": "unhandled",
@@ -363,1007 +520,42 @@
         "tosidebar": true,
         "console": false,
         "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
+        "complete": "payload",
+        "targetType": "msg",
         "statusVal": "",
         "statusType": "auto",
-        "x": 190,
-        "y": 1380,
-        "wires": []
-    },
-    {
-        "id": "b6e4f6de6c577084",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1340,
-        "y": 270,
-        "wires": [
-            [
-                "0583f2c2bfaaf73d",
-                "4ef3a04d62310bcf"
-            ]
-        ]
-    },
-    {
-        "id": "d6e1be7d7c5e48bb",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "queryObjects(26,ports) *CHANGEME*",
-        "func": "msg.payload = '<REPLY queryObjects(26,ports)>\\n' + \n'200 ports[1]\\n' + \n'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 920,
-        "y": 260,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "41cefacfc3563b26",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1,status)",
-        "func": "msg.payload = '<REPLY get(1,status)>\\n'\n+ '1 status[GO]\\n'\n+ '<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 840,
-        "y": 300,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "2307d02c12876114",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(1,view)",
-        "func": "msg.payload = '<REPLY request(1,view)>\\n<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 340,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "46f16d1300a72b06",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(26,view)",
-        "func": "msg.payload = '<REPLY request(26,view)>\\n<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 380,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "242ae27602d0810f",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(200,view)",
-        "func": "msg.payload = '<REPLY request(200,view)>\\n<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 420,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "baf07f2b289f12d0",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1,go)",
-        "func": "msg.payload = '<REPLY set(1,go)>\\n<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 830,
+        "x": 880,
         "y": 460,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
+        "wires": []
     },
     {
-        "id": "e0748d5396ebe4d3",
-        "type": "function",
+        "id": "fa1e6a01b0f1000a",
+        "type": "link out",
         "z": "ae42528ac326c82b",
-        "name": "get(200,state)",
-        "func": "msg.payload = '<REPLY get(200,state)>\\n'\n+'200 state[0x0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 500,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "9debac24a19f5d7b",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(200,railcom[0])",
-        "func": "msg.payload = '<REPLY get(200,railcom[0])>\\n'\n+'200 railcom[00, 0000, 0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n//<202 railcom=\"12, 64, 1\"/>",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 540,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "e3eb122fd86d7765",
-        "type": "inject",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "props": [
-            {
-                "p": "payload"
-            },
-            {
-                "p": "topic",
-                "vt": "str"
-            }
+        "name": "facos.haFeedback",
+        "mode": "link",
+        "links": [
+            "fa1e6a01b0f10008"
         ],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": 0.1,
-        "topic": "",
-        "payload": "",
-        "payloadType": "date",
-        "x": 1440,
-        "y": 500,
-        "wires": [
-            [
-                "0d641dfd9ed2193f"
-            ]
-        ]
-    },
-    {
-        "id": "0d641dfd9ed2193f",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "railcom 1000 >",
-        "func": "msg.payload = '<EVENT 200>\\n'\n+'200 railcom[00, 1000, 1]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1600,
-        "y": 500,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "fbda05265d402b9f",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "railcom occupied",
-        "func": "msg.payload = '<EVENT 200>\\n'\n+'200 state[0x3]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1620,
-        "y": 580,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "2a0811df2a84d89b",
-        "type": "inject",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "props": [
-            {
-                "p": "payload"
-            },
-            {
-                "p": "topic",
-                "vt": "str"
-            }
-        ],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": 0.1,
-        "topic": "",
-        "payload": "",
-        "payloadType": "date",
-        "x": 1440,
-        "y": 580,
-        "wires": [
-            [
-                "fbda05265d402b9f"
-            ]
-        ]
-    },
-    {
-        "id": "24b20f5367e80e72",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "railcom empty",
-        "func": "msg.payload = '<EVENT 200>\\n'\n+'200 state[0x0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1610,
-        "y": 620,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "bb1131f209396d23",
-        "type": "inject",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "props": [
-            {
-                "p": "payload"
-            },
-            {
-                "p": "topic",
-                "vt": "str"
-            }
-        ],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": 0.1,
-        "topic": "",
-        "payload": "",
-        "payloadType": "date",
-        "x": 1440,
-        "y": 620,
-        "wires": [
-            [
-                "24b20f5367e80e72"
-            ]
-        ]
-    },
-    {
-        "id": "979c44d3e53c3a80",
-        "type": "inject",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "props": [
-            {
-                "p": "payload"
-            },
-            {
-                "p": "topic",
-                "vt": "str"
-            }
-        ],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": 0.1,
-        "topic": "",
-        "payload": "",
-        "payloadType": "date",
-        "x": 1440,
-        "y": 540,
-        "wires": [
-            [
-                "b1a9984de7ee32f6"
-            ]
-        ]
-    },
-    {
-        "id": "b1a9984de7ee32f6",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "railcom 1000 <",
-        "func": "msg.payload = '<EVENT 200>\\n'\n+'200 railcom[00, 1000, 0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1610,
-        "y": 540,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "fe94dfb5286fccee",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "queryObjects(10,name)",
-        "func": "msg.payload = '<REPLY queryObjects(10,name)>\\n'\n+'1000 name[\"Fake Locomotive\"]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 880,
-        "y": 580,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "bb8d169645c41fb7",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000,symbol)",
-        "func": "msg.payload = '<REPLY get(1000,symbol)>\\n'\n+'1000 symbol[LOCO_TYPE_E, IMAGE_TYPE_INT, 050]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 620,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "6f2eb58e1d856f49",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000,addr,protocol,symbol,speedindicator)",
-        "func": "msg.payload = '<REPLY get(1000,addr,protocol,symbol,speedindicator)>\\n'\n+'1000 name[\"Fake Locomotive 1000\"]\\n'\n+'1000 speed[0]\\n'\n+'1000 dir[1]\\n'\n+'1000 symbol[LOCO_TYPE_E, IMAGE_TYPE_INT, 050]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 950,
-        "y": 660,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "f48afe6b3efa70b2",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000,speedstep,dir)",
-        "func": "msg.payload = '<REPLY get(1000,speedstep,dir)>\\n'\n+'1000 dir[1]\\n'\n+'1000 speedstep[14]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 880,
+        "x": 1320,
         "y": 700,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "c6cd5d2ec653d98a",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000,funcsymbol[0]...",
-        "func": "msg.payload = '<REPLY get(1000,funcsymbol[0],funcsymbol[1],funcsymbol[2],funcsymbol[3],funcsymbol[4],funcsymbol[5],funcsymbol[6],funcsymbol[7],funcsymbol[8])>\\n'\n+'1000 func[0, 0003]\\n'\n+'1000 func[1, 0]\\n'\n+'1000 func[2, 0]\\n'\n+'1000 func[3, 0]\\n'\n+'1000 func[4, 0]\\n'\n+'1000 func[5, 0]\\n'\n+'1000 func[6, 0]\\n'\n+'1000 func[7, 0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 880,
-        "y": 740,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "f94b28f9e3b0bae2",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000,funcsymbol[0]...",
-        "func": "msg.payload = '<REPLY get(1000,funcsymbol[9],funcsymbol[10],funcsymbol[11],funcsymbol[12],funcsymbol[13],funcsymbol[14],funcsymbol[15])>\\n'\n+'1000 func[8, 1]\\n'\n+'1000 func[9, 1]\\n'\n+'1000 func[10, 0]\\n'\n+'1000 func[11, 0]\\n'\n+'1000 func[12, 0]\\n'\n+'1000 func[13, 0]\\n'\n+'1000 func[14, 0]\\n'\n+'1000 func[15, 0]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 880,
-        "y": 780,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "0d12d2dd1ec63410",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(10,view)",
-        "func": "msg.payload = '<REPLY request(10,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 820,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "8e802fca5dcfdbc0",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(1000,view)",
-        "func": "msg.payload = '<REPLY request(1000,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 860,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "3065e96f7de3e530",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(1000,control,force)",
-        "func": "msg.payload = '<REPLY request(1000,control,force)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 890,
-        "y": 900,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "c0fd1d85329a5e31",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1000,speedstep[0],dir[1])",
-        "func": "msg.payload = '<REPLY set(1000,speedstep[0],dir[1])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 890,
-        "y": 940,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "e85e1586765807f9",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(1000,control)",
-        "func": "msg.payload = '<REPLY release(1000,control)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 870,
-        "y": 980,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "19f6b7846b63fe49",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1000,dir[0])",
-        "func": "msg.payload = '<REPLY set(1000,dir[0])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1020,
-        "wires": [
-            [
-                "b6e4f6de6c577084",
-                "160be93ff00baee4"
-            ]
-        ]
-    },
-    {
-        "id": "7665d429e7382ec6",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1000,dir[1])",
-        "func": "msg.payload = '<REPLY set(1000,dir[1])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1060,
-        "wires": [
-            [
-                "b6e4f6de6c577084",
-                "affe2618d7b80853"
-            ]
-        ]
-    },
-    {
-        "id": "f19d91610d42fbfc",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1000,speedstep[14],dir[1])",
-        "func": "msg.payload = '<REPLY set(1000,speedstep[14],dir[1])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 900,
-        "y": 1100,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "373aff549a1fcbc4",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1000,speedstep[0])",
-        "func": "msg.payload = '<REPLY set(1000,speedstep[0])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 870,
-        "y": 1140,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "da58e79245819431",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(1,view)",
-        "func": "msg.payload = '<REPLY release(1,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1180,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "d1fe31f59f05b690",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(26,view)",
-        "func": "msg.payload = '<REPLY release(26,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1220,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "87c6cfb2a2521fa1",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "set(1,stop)",
-        "func": "msg.payload = '<REPLY set(1,stop)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 840,
-        "y": 1260,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "a878731491a78c1e",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(200,view)",
-        "func": "msg.payload = '<REPLY release(200,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 1300,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "72ae4ff460e9c964",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "get(1000)",
-        "func": "msg.payload = '<REPLY get(1000)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 830,
-        "y": 1340,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "9b8917ee04c95337",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(10,view)",
-        "func": "msg.payload = '<REPLY release(10,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1380,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "e2aad5930745fd32",
-        "type": "mqtt in",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "topic": "trains/sensors/hidden/track/1",
-        "qos": "2",
-        "datatype": "auto",
-        "broker": "5e89e2791ec4dffc",
-        "nl": false,
-        "rap": true,
-        "rh": 0,
-        "inputs": 0,
-        "x": 1540,
-        "y": 940,
-        "wires": [
-            [
-                "06c27b73290e1474"
-            ]
-        ]
-    },
-    {
-        "id": "496b0ffbd9a36621",
-        "type": "mqtt in",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "topic": "trains/sensors/hidden/track/2",
-        "qos": "2",
-        "datatype": "auto",
-        "broker": "5e89e2791ec4dffc",
-        "nl": false,
-        "rap": true,
-        "rh": 0,
-        "inputs": 0,
-        "x": 1540,
-        "y": 1020,
-        "wires": [
-            [
-                "24f54faa3db98677"
-            ]
-        ]
-    },
-    {
-        "id": "06c27b73290e1474",
-        "type": "switch",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "property": "payload",
-        "propertyType": "msg",
-        "rules": [
-            {
-                "t": "eq",
-                "v": "1",
-                "vt": "str"
-            },
-            {
-                "t": "eq",
-                "v": "0",
-                "vt": "str"
-            },
-            {
-                "t": "else"
-            }
-        ],
-        "checkall": "true",
-        "repair": false,
-        "outputs": 3,
-        "x": 1730,
-        "y": 940,
-        "wires": [
-            [],
-            [],
-            []
-        ]
-    },
-    {
-        "id": "24f54faa3db98677",
-        "type": "switch",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "property": "payload",
-        "propertyType": "msg",
-        "rules": [
-            {
-                "t": "eq",
-                "v": "1",
-                "vt": "str"
-            },
-            {
-                "t": "eq",
-                "v": "0",
-                "vt": "str"
-            },
-            {
-                "t": "else"
-            }
-        ],
-        "checkall": "true",
-        "repair": false,
-        "outputs": 3,
-        "x": 1730,
-        "y": 1020,
-        "wires": [
-            [],
-            [],
-            []
-        ]
-    },
-    {
-        "id": "d150813199646371",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "request(11,view,viewswitch)",
-        "func": "msg.payload = '<REPLY request(11,view,viewswitch)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 890,
-        "y": 1420,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "27d8ff35b4e13404",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "accessory handler",
-        "func": "var partsArray = msg.payload.split('[');\nvar id = partsArray[1].split(']');\nvar foo = id[0].substr(id[0].length - 1);\nvar bar = id[0].replace(foo,'');\nmsg.raw = { address : bar, wire: foo };\nmsg.payload = '<REPLY set(11,switch[' + bar + foo + '])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 1460,
-        "wires": [
-            [
-                "b6e4f6de6c577084",
-                "4e2cc9eb2ddadad8"
-            ]
-        ]
-    },
-    {
-        "id": "5fa77ac5974b1f68",
-        "type": "debug",
-        "z": "ae42528ac326c82b",
-        "name": "accessories",
-        "active": true,
-        "tosidebar": true,
-        "console": false,
-        "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
-        "statusVal": "",
-        "statusType": "auto",
-        "x": 1390,
-        "y": 1580,
         "wires": []
     },
     {
-        "id": "4e2cc9eb2ddadad8",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [
-            {
-                "t": "set",
-                "p": "payload",
-                "pt": "msg",
-                "to": "raw",
-                "tot": "msg"
-            },
-            {
-                "t": "delete",
-                "p": "raw",
-                "pt": "msg"
-            }
-        ],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1120,
-        "y": 1460,
-        "wires": [
-            [
-                "5fa77ac5974b1f68",
-                "7485938bd6ccdaec"
-            ]
-        ]
-    },
-    {
-        "id": "58c48a7fe21868be",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "4 g",
-        "func": "msg.payload = '<EVENT 11>\\n'\n+'11 switch[DCC4g]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1470,
-        "y": 780,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "b00ddf14e457c5db",
+        "id": "fa1e6a01b0f1001d",
         "type": "inject",
         "z": "ae42528ac326c82b",
-        "name": "",
+        "name": "smoke get(1,info)",
         "props": [
             {
-                "p": "payload"
+                "p": "payload",
+                "v": "get(1,info)\n",
+                "vt": "str"
             },
             {
-                "p": "topic",
-                "vt": "str"
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
             }
         ],
         "repeat": "",
@@ -1373,42 +565,29 @@
         "topic": "",
         "payload": "",
         "payloadType": "date",
-        "x": 1340,
-        "y": 780,
+        "x": 200,
+        "y": 800,
         "wires": [
             [
-                "58c48a7fe21868be"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
     {
-        "id": "da043003156ebe40",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "4 r",
-        "func": "msg.payload = '<EVENT 11>\\n'\n+'11 switch[DCC4r]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 1470,
-        "y": 820,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "75d05014bb7eaf4f",
+        "id": "fa1e6a01b0f1001e",
         "type": "inject",
         "z": "ae42528ac326c82b",
-        "name": "",
+        "name": "smoke get(1,status)",
         "props": [
             {
-                "p": "topic",
+                "p": "payload",
+                "v": "get(1,status)\n",
                 "vt": "str"
+            },
+            {
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
             }
         ],
         "repeat": "",
@@ -1416,227 +595,109 @@
         "once": false,
         "onceDelay": 0.1,
         "topic": "",
-        "x": 1330,
-        "y": 820,
+        "payload": "",
+        "payloadType": "date",
+        "x": 200,
+        "y": 840,
         "wires": [
             [
-                "da043003156ebe40",
-                "fbe66aa1924de128"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
     {
-        "id": "9937082b58bee53e",
-        "type": "function",
+        "id": "fa1e6a01b0f1001f",
+        "type": "inject",
         "z": "ae42528ac326c82b",
-        "name": "speed handler",
-        "func": "var orig = msg.payload;\nvar partsArray = msg.payload.split(',');\nvar id = partsArray[0].split('(')[1];\nvar speed = partsArray[1].split('[')[1].split(']')[0];\nif (partsArray.length > 2) {\n    dir = partsArray[2].split('[')[1].split(']')[0]; //fix when this doesnt happen\n    msg.raw = { address : id, speed: speed, dir: dir };\n    msg.payload = '<REPLY set(' + id + ',' + 'speedstep['+speed+'],dir['+dir+'])>\\n'\n    +'<END 0 (OK)>\\n';\n} else {\n    msg.raw = { address : id, speed: speed, dir: '' };\n    msg.payload = '<REPLY set(' + id + ',' + 'speedstep['+speed+'])>\\n'\n    +'<END 0 (OK)>\\n';\n}\nmsg.orig = orig;\nreturn msg;",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1500,
-        "wires": [
-            [
-                "b6e4f6de6c577084",
-                "24dc6b2d70f47d9e"
-            ]
-        ]
-    },
-    {
-        "id": "eb50df68b1375919",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "release(11,view)",
-        "func": "msg.payload = '<REPLY release(11,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1540,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
-        ]
-    },
-    {
-        "id": "002df91de7366b64",
-        "type": "debug",
-        "z": "ae42528ac326c82b",
-        "name": "functions",
-        "active": true,
-        "tosidebar": true,
-        "console": false,
-        "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
-        "statusVal": "",
-        "statusType": "auto",
-        "x": 240,
-        "y": 1500,
-        "wires": []
-    },
-    {
-        "id": "f348fbea826c3c76",
-        "type": "function",
-        "z": "ae42528ac326c82b",
-        "name": "function handler",
-        "func": "var partsArray = msg.payload.trim().split(',');\n\nvar id = partsArray[0].split('(')[1];\n\nvar funcparts = msg.payload.split('],');\n\nvar lkl = funcparts\n\nfuncparts.forEach(myFunction);\n\nfunction myFunction(value,index) {\n  var holder = value.replace(')','') + ']';\n  //funcparts[index] = holder.replace(/[\\n\\r]/g, '')\n  \n  if (index == 0) {\n    funcparts[0] = holder.split(',')[1] + ',' + holder.split(',')[2].replace(/[\\n\\r]/g, '')\n  } else {\n    funcparts[index] = funcparts[index].replace(/[\\n\\r]/g, '')\n    funcparts[index] = funcparts[index].replace(')', '')\n    funcparts[index] = funcparts[index] + ']'\n  }\n  funcparts[index] = funcparts[index].replace(']]',']');\n}\n\n\n\nmsg.payload = '<REPLY set(' + id + ',' + funcparts + ')>\\n'\n    +'<END 0 (OK)>\\n';\n\nmsg.fff = funcparts;\nmsg.ggg = partsArray;\nmsg.lkl = lkl;\nreturn msg;\n\n\n//set(1000,func[0,1])",
-        "outputs": 1,
-        "timeout": "",
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 850,
-        "y": 1580,
-        "wires": [
-            [
-                "b6e4f6de6c577084"
-            ]
+        "name": "smoke set(1000,speedstep[14],dir[1])",
+        "props": [
+            {
+                "p": "payload",
+                "v": "set(1000,speedstep[14],dir[1])\n",
+                "vt": "str"
+            },
+            {
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
+            }
         ],
-        "info": "funcparts.forEach(myFunction);\n\nfunction myFunction(value,index) {\n  holder = value.replace(')','') + ']';\n  funcparts[index] = holder.replace(/[\\n\\r]/g, '')\n  if (index == 0) {\n    funcparts[0] = holder.split(',')[1] + ',' + holder.split(',')[2]\n  }\n  funcparts[index] = funcparts[index].replace(']]',']');\n}\n"
-    },
-    {
-        "id": "6d6000f15fe09e73",
-        "type": "mqtt out",
-        "z": "ae42528ac326c82b",
-        "name": "",
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
         "topic": "",
-        "qos": "0",
-        "retain": "true",
-        "respTopic": "",
-        "contentType": "",
-        "userProps": "",
-        "correl": "",
-        "expiry": "",
-        "broker": "5e89e2791ec4dffc",
-        "x": 1570,
-        "y": 1260,
-        "wires": []
-    },
-    {
-        "id": "7485938bd6ccdaec",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [
-            {
-                "t": "set",
-                "p": "topic",
-                "pt": "msg",
-                "to": "'trains/device/' & payload.address",
-                "tot": "jsonata"
-            },
-            {
-                "t": "set",
-                "p": "payload",
-                "pt": "msg",
-                "to": "payload.wire",
-                "tot": "jsonata"
-            }
-        ],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1360,
-        "y": 1460,
+        "payload": "",
+        "payloadType": "date",
+        "x": 240,
+        "y": 880,
         "wires": [
             [
-                "6d6000f15fe09e73"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
     {
-        "id": "3b65419fd4cf07a3",
-        "type": "function",
+        "id": "fa1e6a01b0f10020",
+        "type": "inject",
         "z": "ae42528ac326c82b",
-        "name": "release(1000,view)",
-        "func": "msg.payload = '<REPLY release(1000,view)>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;\n",
-        "outputs": 1,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 860,
-        "y": 1620,
+        "name": "smoke set(11,switch[DCC4g])",
+        "props": [
+            {
+                "p": "payload",
+                "v": "set(11,switch[DCC4g])\n",
+                "vt": "str"
+            },
+            {
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 220,
+        "y": 920,
         "wires": [
             [
-                "b6e4f6de6c577084"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
     {
-        "id": "24dc6b2d70f47d9e",
-        "type": "change",
+        "id": "fa1e6a01b0f10021",
+        "type": "inject",
         "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [
+        "name": "smoke get(200,railcom[0])",
+        "props": [
             {
-                "t": "set",
                 "p": "payload",
-                "pt": "msg",
-                "to": "raw",
-                "tot": "msg"
+                "v": "get(200,railcom[0])\n",
+                "vt": "str"
             },
             {
-                "t": "delete",
-                "p": "raw",
-                "pt": "msg"
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
             }
         ],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1120,
-        "y": 1500,
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 220,
+        "y": 960,
         "wires": [
             [
-                "4721cdc23d5f9473",
-                "5fa77ac5974b1f68"
-            ]
-        ]
-    },
-    {
-        "id": "4721cdc23d5f9473",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [
-            {
-                "t": "set",
-                "p": "topic",
-                "pt": "msg",
-                "to": "'trains/device/' & payload.address",
-                "tot": "jsonata"
-            },
-            {
-                "t": "set",
-                "p": "payload",
-                "pt": "msg",
-                "to": "payload.speed & ',' & payload.dir",
-                "tot": "jsonata"
-            }
-        ],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1360,
-        "y": 1500,
-        "wires": [
-            [
-                "6d6000f15fe09e73"
+                "fa1e6a01b0f10001"
             ]
         ]
     },
@@ -1709,55 +770,59 @@
         ]
     },
     {
-        "id": "0907119b7f3ec90b",
+        "id": "27d8ff35b4e13404",
         "type": "function",
         "z": "ae42528ac326c82b",
-        "name": "railcom ?",
-        "func": "msg.payload = '<EVENT 200>\\n'\n+'200 state[0x10]\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
+        "name": "accessory handler",
+        "func": "var partsArray = msg.payload.split('[');\nvar id = partsArray[1].split(']');\nvar foo = id[0].substr(id[0].length - 1);\nvar bar = id[0].replace(foo,'');\nmsg.raw = { address : bar, wire: foo };\nmsg.payload = '<REPLY set(11,switch[' + bar + foo + '])>\\n'\n+'<END 0 (OK)>\\n';\nreturn msg;",
         "outputs": 1,
+        "timeout": "",
         "noerr": 0,
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 1580,
-        "y": 660,
+        "x": 860,
+        "y": 1460,
         "wires": [
             [
-                "b6e4f6de6c577084"
+                "4e2cc9eb2ddadad8"
             ]
         ]
     },
     {
-        "id": "239eed6891d16e10",
-        "type": "inject",
+        "id": "4e2cc9eb2ddadad8",
+        "type": "change",
         "z": "ae42528ac326c82b",
         "name": "",
-        "props": [
+        "rules": [
             {
-                "p": "payload"
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "raw",
+                "tot": "msg"
             },
             {
-                "p": "topic",
-                "vt": "str"
+                "t": "delete",
+                "p": "raw",
+                "pt": "msg"
             }
         ],
-        "repeat": "",
-        "crontab": "",
-        "once": false,
-        "onceDelay": 0.1,
-        "topic": "",
-        "payload": "",
-        "payloadType": "date",
-        "x": 1430,
-        "y": 660,
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 1120,
+        "y": 1460,
         "wires": [
             [
-                "0907119b7f3ec90b"
+                "7485938bd6ccdaec"
             ]
         ]
     },
     {
-        "id": "d56a85f31fd3e6e0",
+        "id": "7485938bd6ccdaec",
         "type": "change",
         "z": "ae42528ac326c82b",
         "name": "",
@@ -1782,107 +847,11 @@
         "from": "",
         "to": "",
         "reg": false,
-        "x": 1600,
-        "y": 880,
+        "x": 1360,
+        "y": 1460,
         "wires": [
             [
                 "6d6000f15fe09e73"
-            ]
-        ]
-    },
-    {
-        "id": "fbe66aa1924de128",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [
-            {
-                "t": "set",
-                "p": "payload.address",
-                "pt": "msg",
-                "to": "4",
-                "tot": "num"
-            },
-            {
-                "t": "set",
-                "p": "payload.wire",
-                "pt": "msg",
-                "to": "r",
-                "tot": "str"
-            }
-        ],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1420,
-        "y": 880,
-        "wires": [
-            [
-                "d56a85f31fd3e6e0"
-            ]
-        ]
-    },
-    {
-        "id": "5881aa124fa19c8b",
-        "type": "debug",
-        "z": "ae42528ac326c82b",
-        "name": "all input",
-        "active": false,
-        "tosidebar": true,
-        "console": false,
-        "tostatus": false,
-        "complete": "true",
-        "targetType": "full",
-        "statusVal": "",
-        "statusType": "auto",
-        "x": 360,
-        "y": 760,
-        "wires": []
-    },
-    {
-        "id": "572c3c875485f4fa",
-        "type": "delay",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "pauseType": "delay",
-        "timeout": "5",
-        "timeoutUnits": "seconds",
-        "rate": "1",
-        "nbRateUnits": "1",
-        "rateUnits": "second",
-        "randomFirst": "1",
-        "randomLast": "5",
-        "randomUnits": "seconds",
-        "drop": false,
-        "allowrate": false,
-        "outputs": 1,
-        "x": 1200,
-        "y": 180,
-        "wires": [
-            [
-                "753246a0b16af618"
-            ]
-        ]
-    },
-    {
-        "id": "753246a0b16af618",
-        "type": "change",
-        "z": "ae42528ac326c82b",
-        "name": "",
-        "rules": [],
-        "action": "",
-        "property": "",
-        "from": "",
-        "to": "",
-        "reg": false,
-        "x": 1380,
-        "y": 180,
-        "wires": [
-            [
-                "b6e4f6de6c577084",
-                "572c3c875485f4fa"
             ]
         ]
     },
@@ -1894,13 +863,13 @@
         "topic": "trains/device/4",
         "qos": "0",
         "datatype": "auto-detect",
-        "broker": "5e89e2791ec4dffc",
+        "broker": "4e91dd5ffb6a9ee8",
         "nl": false,
         "rap": true,
         "rh": 0,
         "inputs": 0,
         "x": 300,
-        "y": 1900,
+        "y": 2100,
         "wires": [
             [
                 "b13bfa380f4582a8"
@@ -1932,8 +901,8 @@
         "checkall": "true",
         "repair": false,
         "outputs": 3,
-        "x": 490,
-        "y": 1900,
+        "x": 470,
+        "y": 2100,
         "wires": [
             [
                 "3843a287d6cf613b"
@@ -1950,23 +919,27 @@
         "z": "ae42528ac326c82b",
         "name": "",
         "server": "85b918fc1d4c8834",
-        "version": 5,
+        "version": 7,
         "debugenabled": false,
-        "domain": "switch",
-        "service": "turn_off",
+        "action": "switch.turn_off",
+        "floorId": [],
         "areaId": [],
         "deviceId": [],
         "entityId": [
-            "switch.odb_relays_1_1_2"
+            "switch.odb_relays_1_1"
         ],
+        "labelId": [],
         "data": "",
         "dataType": "jsonata",
         "mergeContext": "",
         "mustacheAltTags": false,
         "outputProperties": [],
-        "queue": "none",
-        "x": 760,
-        "y": 1880,
+        "queue": "all",
+        "blockInputOverrides": false,
+        "domain": "switch",
+        "service": "turn_off",
+        "x": 690,
+        "y": 2060,
         "wires": [
             []
         ]
@@ -1977,110 +950,281 @@
         "z": "ae42528ac326c82b",
         "name": "",
         "server": "85b918fc1d4c8834",
-        "version": 5,
+        "version": 7,
         "debugenabled": false,
-        "domain": "switch",
-        "service": "turn_on",
+        "action": "switch.turn_on",
+        "floorId": [],
         "areaId": [],
         "deviceId": [],
         "entityId": [
-            "switch.odb_relays_1_1_2"
+            "switch.odb_relays_1_1"
         ],
+        "labelId": [],
         "data": "",
         "dataType": "jsonata",
         "mergeContext": "",
         "mustacheAltTags": false,
         "outputProperties": [],
-        "queue": "none",
-        "x": 760,
-        "y": 1920,
+        "queue": "all",
+        "blockInputOverrides": false,
+        "domain": "switch",
+        "service": "turn_on",
+        "x": 690,
+        "y": 2120,
         "wires": [
             []
         ]
     },
     {
-        "id": "86b0ba7b926cf6af",
-        "type": "group",
+        "id": "8759c8a437d1bfc1",
+        "type": "function",
         "z": "ae42528ac326c82b",
-        "style": {
-            "stroke": "#999999",
-            "stroke-opacity": "1",
-            "fill": "none",
-            "fill-opacity": "1",
-            "label": true,
-            "label-position": "nw",
-            "color": "#a4a4a4"
-        },
-        "nodes": [
-            "5aa5099aaeaf447a"
-        ],
-        "x": 154,
-        "y": 239,
-        "w": 352,
-        "h": 82
+        "name": "function 114",
+        "func": "var state = flow.get(\"feedback1.state\") || 0;\nif (msg.topic == \"binary_sensor.train_prox_1_sensor_2\") {\n    if (msg.payload) {\n        state = state + 2;\n    } else {\n        state = Math.abs(state - 2);\n    }\n    flow.set(\"feedback1.state\", state)\n} else if (msg.topic == \"binary_sensor.train_prox_1_sensor_1\") {\n    if (msg.payload) {\n        state = state + 1;\n    } else {\n        state = Math.abs(state - 1);\n    }\n    flow.set(\"feedback1.state\", state)\n}\n\nvar newpay = '<EVENT 200>\\n'\n    + '200 state[0x' + state + ']\\n'\n    + '<END 0 (OK)>\\n';\n    \nmsg.payload = {};\nmsg.data = {};\nmsg.payload = newpay;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "// Code added here will be run once\n// whenever the node is started.\nflow.set(\"feedback1.state\", 0);",
+        "finalize": "// Code added here will be run when the\n// node is being stopped or re-deployed.\nflow.set(\"feedback1.state\", 0);",
+        "libs": [],
+        "x": 990,
+        "y": 2420,
+        "wires": [
+            [
+                "fa1e6a01b0f1000a"
+            ]
+        ]
     },
     {
-        "id": "5aa5099aaeaf447a",
-        "type": "comment",
+        "id": "cfd7460388fc6861",
+        "type": "server-state-changed",
         "z": "ae42528ac326c82b",
-        "g": "86b0ba7b926cf6af",
-        "name": "git submodule update --remote --merge",
-        "info": "",
-        "x": 330,
-        "y": 280,
+        "name": "",
+        "server": "85b918fc1d4c8834",
+        "version": 6,
+        "outputs": 1,
+        "exposeAsEntityConfig": "",
+        "entities": {
+            "entity": [
+                "binary_sensor.train_prox_1_sensor_1"
+            ],
+            "substring": [],
+            "regex": []
+        },
+        "outputInitially": true,
+        "stateType": "habool",
+        "ifState": "",
+        "ifStateType": "str",
+        "ifStateOperator": "is",
+        "outputOnlyOnStateChange": true,
+        "for": "0",
+        "forType": "num",
+        "forUnits": "minutes",
+        "ignorePrevStateNull": false,
+        "ignorePrevStateUnknown": false,
+        "ignorePrevStateUnavailable": false,
+        "ignoreCurrentStateUnknown": false,
+        "ignoreCurrentStateUnavailable": false,
+        "outputProperties": [
+            {
+                "property": "payload",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "entityState"
+            },
+            {
+                "property": "data",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "eventData"
+            },
+            {
+                "property": "topic",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "triggerId"
+            }
+        ],
+        "x": 500,
+        "y": 2500,
+        "wires": [
+            [
+                "8759c8a437d1bfc1"
+            ]
+        ]
+    },
+    {
+        "id": "b922981349a7ceb7",
+        "type": "server-state-changed",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "server": "85b918fc1d4c8834",
+        "version": 6,
+        "outputs": 1,
+        "exposeAsEntityConfig": "",
+        "entities": {
+            "entity": [
+                "binary_sensor.train_prox_1_sensor_2"
+            ],
+            "substring": [],
+            "regex": []
+        },
+        "outputInitially": true,
+        "stateType": "habool",
+        "ifState": "",
+        "ifStateType": "str",
+        "ifStateOperator": "is",
+        "outputOnlyOnStateChange": true,
+        "for": "0",
+        "forType": "num",
+        "forUnits": "minutes",
+        "ignorePrevStateNull": false,
+        "ignorePrevStateUnknown": false,
+        "ignorePrevStateUnavailable": false,
+        "ignoreCurrentStateUnknown": false,
+        "ignoreCurrentStateUnavailable": false,
+        "outputProperties": [
+            {
+                "property": "payload",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "entityState"
+            },
+            {
+                "property": "data",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "eventData"
+            },
+            {
+                "property": "topic",
+                "propertyType": "msg",
+                "value": "",
+                "valueType": "triggerId"
+            }
+        ],
+        "x": 500,
+        "y": 2680,
+        "wires": [
+            [
+                "8759c8a437d1bfc1"
+            ]
+        ]
+    },
+    {
+        "id": "6d6000f15fe09e73",
+        "type": "mqtt out",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "topic": "",
+        "qos": "0",
+        "retain": "true",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "4e91dd5ffb6a9ee8",
+        "x": 1500,
+        "y": 380,
         "wires": []
     },
     {
-        "id": "5e89e2791ec4dffc",
-        "type": "mqtt-broker",
-        "name": "mqtt",
-        "broker": "192.168.5.1",
-        "port": "1883",
-        "clientid": "node-red",
-        "autoConnect": true,
-        "usetls": false,
-        "protocolVersion": "4",
-        "keepalive": "60",
-        "cleansession": true,
-        "birthTopic": "",
-        "birthQos": "0",
-        "birthRetain": "false",
-        "birthPayload": "",
-        "birthMsg": {},
-        "closeTopic": "",
-        "closeQos": "0",
-        "closeRetain": "false",
-        "closePayload": "",
-        "closeMsg": {},
-        "willTopic": "",
-        "willQos": "0",
-        "willRetain": "false",
-        "willPayload": "",
-        "willMsg": {},
-        "userProps": "",
-        "sessionExpiry": ""
+        "id": "fa1e6a01b0f10023",
+        "type": "inject",
+        "z": "ae42528ac326c82b",
+        "name": "smoke set(1,stop) & go",
+        "props": [
+            {
+                "p": "payload",
+                "v": "set(1,stop)\nset(1,go)\n",
+                "vt": "str"
+            },
+            {
+                "p": "_session",
+                "v": "{\"type\":\"tcp\",\"id\":\"smoke\"}",
+                "vt": "json"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 220,
+        "y": 1000,
+        "wires": [
+            [
+                "fa1e6a01b0f10001"
+            ]
+        ]
     },
     {
-        "id": "85b918fc1d4c8834",
-        "type": "server",
-        "name": "Home Assistant",
-        "version": 5,
-        "addon": false,
-        "rejectUnauthorizedCerts": false,
-        "ha_boolean": "y|yes|true|on|home|open",
-        "connectionDelay": true,
-        "cacheJson": true,
-        "heartbeat": true,
-        "heartbeatInterval": "30",
-        "areaSelector": "friendlyName",
-        "deviceSelector": "friendlyName",
-        "entitySelector": "friendlyName",
-        "statusSeparator": ": ",
-        "statusYear": "hidden",
-        "statusMonth": "short",
-        "statusDay": "numeric",
-        "statusHourCycle": "h23",
-        "statusTimeFormat": "h:m:s",
-        "enableGlobalContextStore": true
+        "id": "24dc6b2d70f47d9e",
+        "type": "change",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "raw",
+                "tot": "msg"
+            },
+            {
+                "t": "delete",
+                "p": "raw",
+                "pt": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 1120,
+        "y": 1500,
+        "wires": [
+            [
+                "4721cdc23d5f9473"
+            ]
+        ]
+    },
+    {
+        "id": "4721cdc23d5f9473",
+        "type": "change",
+        "z": "ae42528ac326c82b",
+        "name": "",
+        "rules": [
+            {
+                "t": "set",
+                "p": "topic",
+                "pt": "msg",
+                "to": "'trains/device/' & payload.address",
+                "tot": "jsonata"
+            },
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "payload.speed & ',' & payload.dir",
+                "tot": "jsonata"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 1360,
+        "y": 1500,
+        "wires": [
+            [
+                "6d6000f15fe09e73"
+            ]
+        ]
     }
 ]
