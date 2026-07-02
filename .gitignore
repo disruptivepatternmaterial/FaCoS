@@ -135,3 +135,5 @@ tests/.nr-data/
 tests/.mqtt-cap.log
 tests/test-flow.json
 cursor-scratch/
+.DS_Store
+**/.DS_Store
